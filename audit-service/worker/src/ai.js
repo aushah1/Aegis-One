@@ -106,19 +106,49 @@ function compactChecks(checks = {}) {
 }
 
 function parseAIResponse(text) {
-  if (!text) {
+  if (!text || typeof text !== "string") {
     throw new Error("AI returned an empty response");
   }
 
-  const cleaned = text
+  let cleaned = text.trim();
+
+  // Remove Markdown code fences.
+  cleaned = cleaned
     .replace(/^```(?:json)?\s*/i, "")
     .replace(/\s*```$/, "")
     .trim();
 
-  const result = JSON.parse(cleaned);
+  let result;
+
+  try {
+    result = JSON.parse(cleaned);
+  } catch {
+    // Handle explanatory text surrounding a JSON object.
+    const start = cleaned.indexOf("{");
+    const end = cleaned.lastIndexOf("}");
+
+    if (start === -1 || end <= start) {
+      throw new Error(
+        "AI response contains no JSON object. Preview: " +
+          cleaned.slice(0, 160),
+      );
+    }
+
+    const extracted = cleaned.slice(start, end + 1);
+
+    try {
+      result = JSON.parse(extracted);
+    } catch {
+      throw new Error(
+        "AI returned malformed JSON. Preview: " + cleaned.slice(0, 160),
+      );
+    }
+  }
 
   if (
     !result ||
+    typeof result !== "object" ||
+    Array.isArray(result) ||
     !["A", "B", "C", "D", "F"].includes(result.grade) ||
     typeof result.headline !== "string" ||
     typeof result.summary !== "string" ||
@@ -126,7 +156,7 @@ function parseAIResponse(text) {
     !Array.isArray(result.quickWins) ||
     !Array.isArray(result.whatsGoingWell)
   ) {
-    throw new Error("Invalid AI response structure");
+    throw new Error("AI returned JSON with an invalid report structure");
   }
 
   return result;
@@ -152,71 +182,97 @@ async function callGemini(url, checks) {
   const model = process.env.GEMINI_MODEL || "gemma-4-26b-a4b-it";
 
   const endpoint =
-    "https://generativelanguage.googleapis.com/" +
-    `v1beta/models/${encodeURIComponent(model)}` +
+    "https://generativelanguage.googleapis.com/v1beta/models/" +
+    encodeURIComponent(model) +
     ":generateContent";
 
-  const payload = {
-    systemInstruction: {
-      parts: [{ text: SYSTEM }],
-    },
-
-    contents: [
-      {
-        role: "user",
-        parts: [
-          {
-            text: JSON.stringify({
-              url,
-              checks: compactChecks(checks),
-            }),
-          },
-        ],
-      },
-    ],
-
-    generationConfig: {
-      temperature: 0.2,
-      maxOutputTokens: 2048,
-    },
-  };
-
-  // Only apply flash-specific configuration
-  // to models where it is supported.
-  if (model.includes("flash")) {
-    // Leave thinkingConfig unspecified for
-    // broad model compatibility.
-  }
-
-  console.log(`[AI] Requesting ${model}...`);
-
-  const response = await fetch(endpoint, {
-    method: "POST",
-
-    headers: {
-      "Content-Type": "application/json",
-      "x-goog-api-key": apiKey,
-    },
-
-    body: JSON.stringify(payload),
-
-    signal: AbortSignal.timeout(REQUEST_TIMEOUT),
+  const auditData = JSON.stringify({
+    url,
+    checks: compactChecks(checks),
   });
 
-  if (!response.ok) {
-    const body = (await response.text()).slice(0, 500);
+  let previousError = null;
 
-    throw createAPIError("Gemini", response, body);
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    const prompt =
+      SYSTEM +
+      "\n\nIMPORTANT: Output ONLY a valid JSON object." +
+      "\nDo not include an introduction, explanations outside JSON, or Markdown." +
+      "\nStart your response with { and finish with }." +
+      "\nDo not copy the instructions into the response." +
+      (previousError
+        ? "\nYour previous response was invalid: " +
+          previousError +
+          "\nGenerate a corrected JSON report."
+        : "") +
+      "\n\nWEBSITE AUDIT DATA:\n" +
+      auditData;
+
+    console.log(`[AI] Gemma request ${attempt}/2 using ${model}`);
+
+    const response = await fetch(endpoint, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-goog-api-key": apiKey,
+      },
+      body: JSON.stringify({
+        contents: [
+          {
+            role: "user",
+            parts: [{ text: prompt }],
+          },
+        ],
+        generationConfig: {
+          temperature: 0.1,
+          maxOutputTokens: 4096,
+        },
+      }),
+      signal: AbortSignal.timeout(REQUEST_TIMEOUT),
+    });
+
+    if (!response.ok) {
+      const body = (await response.text()).slice(0, 500);
+
+      const error = new Error(`Gemini API ${response.status}: ${body}`);
+      error.status = response.status;
+
+      throw error;
+    }
+
+    const data = await response.json();
+
+    const candidate = data.candidates?.[0];
+
+    const text =
+      candidate?.content?.parts?.map((part) => part.text || "").join("") || "";
+
+    if (!text) {
+      throw new Error(
+        "Gemma returned no text. Finish reason: " +
+          (candidate?.finishReason || "unknown"),
+      );
+    }
+
+    try {
+      const result = parseAIResponse(text);
+
+      console.log("[AI] Valid JSON summary generated");
+
+      return result;
+    } catch (error) {
+      previousError = error.message;
+
+      console.warn(
+        `[AI] Invalid JSON response on attempt ${attempt}:`,
+        error.message,
+      );
+    }
   }
 
-  const data = await response.json();
-
-  const text =
-    data.candidates?.[0]?.content?.parts
-      ?.map((part) => part.text || "")
-      .join("") || "";
-
-  return parseAIResponse(text);
+  throw new Error(
+    "Gemma failed to generate valid JSON after 2 attempts: " + previousError,
+  );
 }
 
 // ---------------- GROQ FALLBACK ----------------
