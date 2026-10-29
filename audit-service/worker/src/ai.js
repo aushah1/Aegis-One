@@ -1,129 +1,354 @@
-// AI summary with automatic fallback across free-tier providers.
-// Order tried is controlled by AI_PROVIDERS (comma list), default "groq,gemini".
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-const SYSTEM = `You are a senior web performance, SEO, accessibility and security consultant.
-You receive JSON results from automated website checks. Write a clear audit summary for a non-technical site owner.
-Rules:
-- Use ONLY the numbers and facts in the input. Never invent scores or metrics.
-- If a check is missing or failed, say it could not be measured; do not guess.
-- Respond with a single JSON object and nothing else.
-Schema:
+const REQUEST_TIMEOUT = Number(process.env.AI_REQUEST_TIMEOUT_MS || 60000);
+
+const SYSTEM = `
+You are an expert website auditor specializing in
+performance, SEO, accessibility, and security.
+
+Analyze the provided website audit data and create
+an actionable report for a non-technical website owner.
+
+Important rules:
+- Use only facts present in the audit data.
+- Never invent scores, metrics, or vulnerabilities.
+- Missing checks must be reported as unavailable.
+- Prioritize issues based on measured evidence.
+- Return ONLY valid JSON.
+
+Return this structure:
+
 {
-  "grade": "A|B|C|D|F",
-  "headline": "one-sentence verdict",
-  "summary": "2-3 sentence overview in plain language",
+  "grade": "B",
+  "headline": "Brief overall assessment",
+  "summary": "A concise explanation of findings",
   "topIssues": [
-    { "title": "", "area": "performance|seo|accessibility|security|best-practices",
-      "impact": "why it matters to visitors or the business",
-      "fix": "specific, actionable steps",
-      "effort": "low|medium|high", "priority": 1 }
+    {
+      "title": "Issue title",
+      "area": "performance",
+      "impact": "Why this issue matters",
+      "fix": "Specific recommended action",
+      "effort": "low",
+      "priority": 1
+    }
   ],
-  "quickWins": ["short, easy fixes"],
-  "whatsGoingWell": ["short positives"]
-}
-Return at most 5 topIssues, ordered by priority (1 = most important).`;
-
-function parseJson(text) {
-  return JSON.parse(text.replace(/```json|```/g, '').trim());
+  "quickWins": ["Easy improvement"],
+  "whatsGoingWell": ["Positive finding"]
 }
 
-// ---------- Groq (free, no credit card, OpenAI-compatible) ----------
-async function callGroq(url, checks) {
-  const key = process.env.GROQ_API_KEY;
-  if (!key) throw Object.assign(new Error('GROQ_API_KEY is not set'), { status: 'no_key' });
+Allowed grades: A, B, C, D, F.
+Allowed areas: performance, seo, accessibility,
+security, best-practices.
+Allowed efforts: low, medium, high.
 
-  const model = process.env.GROQ_MODEL || 'llama-3.3-70b-versatile';
+Return a maximum of five top issues.
+`;
 
-  const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
-    method: 'POST',
-    headers: { 'content-type': 'application/json', authorization: `Bearer ${key}` },
-    body: JSON.stringify({
-      model,
-      temperature: 0.3,
-      max_tokens: 4096,
-      response_format: { type: 'json_object' },
-      messages: [
-        { role: 'system', content: SYSTEM },
-        { role: 'user', content: JSON.stringify({ url, checks }) },
-      ],
-    }),
-    signal: AbortSignal.timeout(25_000),
+// Limit payload size to improve API reliability.
+function compactChecks(checks = {}) {
+  const psi = checks.psi || {};
+  const seo = checks.seo || {};
+
+  const compact = {
+    psi: psi.error
+      ? { error: psi.error }
+      : {
+          scores: psi.scores,
+          metrics: psi.metrics,
+          failedAudits: (psi.failedAudits || []).slice(0, 8).map((issue) => ({
+            title: issue.title,
+            category: issue.category,
+            score: issue.score,
+            detail: issue.detail,
+          })),
+        },
+
+    seo: seo.error
+      ? { error: seo.error }
+      : {
+          title: seo.title,
+          description: seo.description,
+          imageCount: seo.imageCount,
+          imagesMissingAlt: seo.imagesMissingAlt,
+          issues: (seo.issues || []).slice(0, 10),
+        },
+
+    headers: checks.headers,
+    ssl: checks.ssl,
+  };
+
+  // Guard against unusually large nested data.
+  const json = JSON.stringify(compact);
+
+  if (json.length > 16000) {
+    return {
+      psi: compact.psi?.scores ? { scores: compact.psi.scores } : compact.psi,
+      seo: compact.seo?.error
+        ? compact.seo
+        : {
+            title: compact.seo?.title,
+            issues: compact.seo?.issues?.slice(0, 5),
+          },
+      headers: compact.headers?.error
+        ? compact.headers
+        : {
+            summary: JSON.stringify(compact.headers).slice(0, 1800),
+          },
+      ssl: compact.ssl?.error
+        ? compact.ssl
+        : {
+            summary: JSON.stringify(compact.ssl).slice(0, 1200),
+          },
+    };
+  }
+
+  return compact;
+}
+
+function parseAIResponse(text) {
+  if (!text) {
+    throw new Error("AI returned an empty response");
+  }
+
+  const cleaned = text
+    .replace(/^```(?:json)?\s*/i, "")
+    .replace(/\s*```$/, "")
+    .trim();
+
+  const result = JSON.parse(cleaned);
+
+  if (
+    !result ||
+    !["A", "B", "C", "D", "F"].includes(result.grade) ||
+    typeof result.headline !== "string" ||
+    typeof result.summary !== "string" ||
+    !Array.isArray(result.topIssues) ||
+    !Array.isArray(result.quickWins) ||
+    !Array.isArray(result.whatsGoingWell)
+  ) {
+    throw new Error("Invalid AI response structure");
+  }
+
+  return result;
+}
+
+function createAPIError(provider, response, body) {
+  const error = new Error(`${provider} API ${response.status}: ${body}`);
+
+  error.status = response.status;
+
+  return error;
+}
+
+// ---------------- GEMINI / GEMMA 4 ----------------
+
+async function callGemini(url, checks) {
+  const apiKey = process.env.GEMINI_API_KEY;
+
+  if (!apiKey) {
+    throw new Error("GEMINI_API_KEY is missing");
+  }
+
+  const model = process.env.GEMINI_MODEL || "gemma-4-26b-a4b-it";
+
+  const endpoint =
+    "https://generativelanguage.googleapis.com/" +
+    `v1beta/models/${encodeURIComponent(model)}` +
+    ":generateContent";
+
+  const payload = {
+    systemInstruction: {
+      parts: [{ text: SYSTEM }],
+    },
+
+    contents: [
+      {
+        role: "user",
+        parts: [
+          {
+            text: JSON.stringify({
+              url,
+              checks: compactChecks(checks),
+            }),
+          },
+        ],
+      },
+    ],
+
+    generationConfig: {
+      temperature: 0.2,
+      maxOutputTokens: 2048,
+    },
+  };
+
+  // Only apply flash-specific configuration
+  // to models where it is supported.
+  if (model.includes("flash")) {
+    // Leave thinkingConfig unspecified for
+    // broad model compatibility.
+  }
+
+  console.log(`[AI] Requesting ${model}...`);
+
+  const response = await fetch(endpoint, {
+    method: "POST",
+
+    headers: {
+      "Content-Type": "application/json",
+      "x-goog-api-key": apiKey,
+    },
+
+    body: JSON.stringify(payload),
+
+    signal: AbortSignal.timeout(REQUEST_TIMEOUT),
   });
 
-  if (!res.ok) {
-    const body = (await res.text()).slice(0, 300);
-    throw Object.assign(new Error(`Groq API ${res.status}: ${body}`), { status: res.status });
+  if (!response.ok) {
+    const body = (await response.text()).slice(0, 500);
+
+    throw createAPIError("Gemini", response, body);
   }
-  const data = await res.json();
-  const text = data.choices?.[0]?.message?.content || '';
-  if (!text) throw new Error('Groq returned no content');
-  return parseJson(text);
+
+  const data = await response.json();
+
+  const text =
+    data.candidates?.[0]?.content?.parts
+      ?.map((part) => part.text || "")
+      .join("") || "";
+
+  return parseAIResponse(text);
 }
 
-// ---------- Gemini (Google AI Studio, free tier) ----------
-async function callGemini(url, checks) {
-  const key = process.env.GEMINI_API_KEY;
-  if (!key) throw Object.assign(new Error('GEMINI_API_KEY is not set'), { status: 'no_key' });
+// ---------------- GROQ FALLBACK ----------------
 
-  const model = process.env.GEMINI_MODEL || 'gemini-3.8-flash';
-  const generationConfig = { responseMimeType: 'application/json', temperature: 0.3, maxOutputTokens: 4096 };
-  if (model.includes('flash')) generationConfig.thinkingConfig = { thinkingBudget: 0 };
+async function callGroq(url, checks) {
+  const apiKey = process.env.GROQ_API_KEY;
 
-  const res = await fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
+  if (!apiKey) {
+    throw new Error("GROQ_API_KEY is missing");
+  }
+
+  const model = process.env.GROQ_MODEL || "llama-3.1-8b-instant";
+
+  const response = await fetch(
+    "https://api.groq.com/openai/v1/chat/completions",
     {
-      method: 'POST',
-      headers: { 'content-type': 'application/json', 'x-goog-api-key': key },
+      method: "POST",
+
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${apiKey}`,
+      },
+
       body: JSON.stringify({
-        systemInstruction: { parts: [{ text: SYSTEM }] },
-        contents: [{ role: 'user', parts: [{ text: JSON.stringify({ url, checks }) }] }],
-        generationConfig,
+        model,
+        temperature: 0.2,
+        max_tokens: 2048,
+        response_format: {
+          type: "json_object",
+        },
+
+        messages: [
+          {
+            role: "system",
+            content: SYSTEM,
+          },
+          {
+            role: "user",
+            content: JSON.stringify({
+              url,
+              checks: compactChecks(checks),
+            }),
+          },
+        ],
       }),
-      signal: AbortSignal.timeout(25_000),
-    }
+
+      signal: AbortSignal.timeout(REQUEST_TIMEOUT),
+    },
   );
 
-  if (!res.ok) {
-    const body = (await res.text()).slice(0, 300);
-    throw Object.assign(new Error(`Gemini API ${res.status}: ${body}`), { status: res.status });
+  if (!response.ok) {
+    const body = (await response.text()).slice(0, 500);
+
+    throw createAPIError("Groq", response, body);
   }
-  const data = await res.json();
-  const text = data.candidates?.[0]?.content?.parts?.map((p) => p.text || '').join('') || '';
-  if (!text) throw new Error(`Gemini returned no content (${data.candidates?.[0]?.finishReason || 'unknown'})`);
-  return parseJson(text);
+
+  const data = await response.json();
+
+  const text = data.choices?.[0]?.message?.content;
+
+  return parseAIResponse(text);
 }
 
-const PROVIDERS = { groq: callGroq, gemini: callGemini };
-const RETRYABLE = new Set([429, 503]); // rate-limited or temporarily overloaded
+// ---------------- RETRY LOGIC ----------------
 
-async function callWithRetry(fn, url, checks, retries = 2) {
-  let lastErr;
-  for (let attempt = 0; attempt <= retries; attempt++) {
+const RETRYABLE_STATUS = new Set([429, 500, 502, 503, 504]);
+
+async function callWithRetry(fn, url, checks, maxRetries = 2) {
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
     try {
       return await fn(url, checks);
-    } catch (err) {
-      lastErr = err;
-      if (!RETRYABLE.has(err.status) || attempt === retries) throw err;
-      await sleep(1000 * 2 ** attempt); // 1s, then 2s
+    } catch (error) {
+      const networkFailure =
+        error.name === "TimeoutError" ||
+        error.name === "AbortError" ||
+        error.name === "TypeError" ||
+        error.cause?.code === "UND_ERR_CONNECT_TIMEOUT";
+
+      const retryable = RETRYABLE_STATUS.has(error.status) || networkFailure;
+
+      if (!retryable || attempt === maxRetries) {
+        throw error;
+      }
+
+      const delay = 1500 * 2 ** attempt + Math.floor(Math.random() * 500);
+
+      console.warn(`[AI] Attempt ${attempt + 1} failed: ` + error.message);
+
+      console.log(`[AI] Retrying after ${delay}ms`);
+
+      await sleep(delay);
     }
   }
-  throw lastErr;
 }
 
+// ---------------- MAIN EXPORT ----------------
+
 export async function summarize(url, checks) {
-  const order = (process.env.AI_PROVIDERS || 'groq,gemini')
-    .split(',')
-    .map((s) => s.trim())
-    .filter((name) => PROVIDERS[name]);
+  const providers = (process.env.AI_PROVIDERS || "gemini")
+    .split(",")
+    .map((item) => item.trim())
+    .filter(Boolean);
+
+  const functions = {
+    gemini: callGemini,
+    groq: callGroq,
+  };
 
   const errors = [];
-  for (const name of order) {
+
+  for (const provider of providers) {
+    const fn = functions[provider];
+
+    if (!fn) {
+      errors.push(`Unknown provider: ${provider}`);
+      continue;
+    }
+
     try {
-      return await callWithRetry(PROVIDERS[name], url, checks);
-    } catch (err) {
-      errors.push(`${name}: ${err.message}`);
+      console.log(`[AI] Using provider: ${provider}`);
+
+      const result = await callWithRetry(fn, url, checks);
+
+      console.log(`[AI] ${provider} summary successful`);
+
+      return result;
+    } catch (error) {
+      console.error(`[AI] ${provider} failed:`, error.message);
+
+      errors.push(`${provider}: ${error.message}`);
     }
   }
-  throw new Error(`All AI providers failed — ${errors.join(' | ')}`);
+
+  throw new Error("All AI providers failed — " + errors.join(" | "));
 }
