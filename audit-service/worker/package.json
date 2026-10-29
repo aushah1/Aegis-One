@@ -1,0 +1,14 @@
+{
+  "name": "worker",
+  "type": "module",
+  "scripts": {
+    "dev": "node --watch --env-file=../.env src/index.js",
+    "start": "node --env-file=../.env src/index.js"
+  },
+  "dependencies": {
+    "bullmq": "^5.0.0",
+    "cheerio": "^1.0.0",
+    "ioredis": "^5.4.0",
+    "mongoose": "^8.5.0"
+  }
+}

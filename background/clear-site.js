@@ -1,0 +1,24 @@
+// "Clear this site's data" in the popup (IDEA.md: a clear-cache button with an explanation). Loaded by /background.js.
+// Forgets one site's own cookies, storage and cache in Chrome, so the site can't link your next visit to earlier ones
+// (other companies' tracking cookies stay; the popup says so). Never touches history, passwords or downloads.
+// Only Aegis One's own pages can ask.
+(function () {
+  const DOMAIN = /^(?=.{1,253}$)([a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$/;
+
+  chrome.runtime.onMessage.addListener((msg, sender, reply) => {
+    if (!msg || msg.type !== "aegis-clear-site") return;
+    if (!sender || !String(sender.url || "").startsWith(`chrome-extension://${chrome.runtime.id}/`)) return;
+    const domain = String(msg.domain || "").toLowerCase().replace(/^www\./, "");
+    if (!DOMAIN.test(domain)) { reply({ ok: false }); return; }
+    const origins = [];
+    for (const scheme of ["https", "http"]) for (const host of [domain, "www." + domain]) origins.push(`${scheme}://${host}`);
+    // How many of the site's cookies Chrome is about to forget (it clears them for the whole site, subdomains too), so
+    // the pop-up can say what it removed. Only the count is used: no cookie names or values are kept or sent.
+    const counted = chrome.cookies && chrome.cookies.getAll
+      ? chrome.cookies.getAll({ domain }).then((all) => all.length, () => null) : Promise.resolve(null);
+    counted.then((cookies) => chrome.browsingData.remove({ origins }, {
+      cookies: true, localStorage: true, indexedDB: true, cacheStorage: true, serviceWorkers: true, cache: true
+    }).then(() => reply(cookies === null ? { ok: true } : { ok: true, cookies }), () => reply({ ok: false })));
+    return true;   // answers once Chrome is done
+  });
+})();

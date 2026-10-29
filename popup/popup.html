@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="en" data-theme="light" data-style="glass">
+<head>
+  <meta charset="utf-8">
+  <meta name="color-scheme" content="light dark">
+  <title>Aegis One</title>
+  <link rel="stylesheet" href="../shared/theme.css">
+  <link rel="stylesheet" href="../shared/ui.css">
+  <link rel="stylesheet" href="popup.css">
+  <link rel="stylesheet" href="aegis.css">
+  <script src="../shared/settings.js"></script>
+  <script src="../shared/theme-boot.js"></script>
+</head>
+<body>
+  <div class="backdrop" aria-hidden="true"></div>
+
+  <header class="bar top glass" data-liquid="pill">
+    <span class="brand" id="wordmark"></span>
+    <span class="sample-badge" id="sample-note" title="Showing sample data until Aegis One has watched a few pages." hidden>Sample data</span>
+    <span class="bar-actions">
+      <button class="icon-btn" id="open-dashboard-top" title="Open the dashboard" aria-label="Open the dashboard"></button>
+      <button class="icon-btn" id="open-settings" title="Settings" aria-label="Settings"></button>
+    </span>
+  </header>
+
+  <main id="app" aria-live="polite"></main>
+
+  <footer class="bar bottom glass" data-liquid="pill" id="actions">
+    <button class="btn-main" id="ask-site" hidden></button>
+    <button class="btn-quiet" id="open-audit" type="button">Website audit ↗</button>
+    <button class="btn-quiet" id="open-dashboard">Open dashboard</button>
+  </footer>
+
+  <script src="../shared/logo.js"></script>
+  <script src="../shared/lists.js"></script>
+  <script src="../shared/cookies.js"></script>
+  <script src="../shared/example-data.js"></script>
+  <script src="../shared/data.js"></script>
+  <script src="../shared/site-summary.js"></script>
+  <script src="../shared/icons.js"></script>
+  <script src="../shared/liquid-glass.js"></script>
+  <script src="panel-mode.js"></script>
+  <script src="popup.js"></script>
+  <script src="audit-link.js"></script>
+</body>
+</html>

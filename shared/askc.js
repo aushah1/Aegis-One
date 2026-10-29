@@ -1,0 +1,1804 @@
+/*
+  Ask Aegis brain: turns the user's browsing data into evidence for Gemma,
+  then returns the reply in the shape dashboard/ask-c.js expects:
+    { answer, trace: [{ tool, label }], error? }
+  Used by background.js. Pure functions, so tests can run it with a fake Gemma.
+*/
+(function () {
+  const SYSTEM_PROMPT = `You are Aegis, the friendly privacy guide inside the Aegis One browser extension.
+
+How to answer:
+- Talk to the person as "you". Never say "the user".
+- Plain English, no jargon. 2 to 4 short sentences.
+- Add a last line starting "What you can do:" with only the 2 or 3 steps that fit the question, from the Steps list, only when the person asks for advice or about a risk (should I worry, is it safe, how do I protect myself, was it hacked). Leave it out of explanations, definitions and follow-up questions.
+- You are only Aegis One's privacy guide, not a general assistant. Don't write poems, stories, jokes, code or homework. Questions about hacks, breaches, security, companies, websites, trackers, cookies and data are always on topic: answer them. Only for a request that has nothing to do with privacy, say in one sentence that you only help with privacy.
+- If the evidence has nothing about what the person asked, say plainly that Aegis One has no record of it, then answer what you can from the evidence.
+- "Earlier in this conversation" shows the last questions and your answers. Use it to understand follow-ups like "what about its cookies?", but answer only the new question.
+- Answer the question that was asked first. Then connect it to their own browsing if something there is relevant.
+- Use ONLY the evidence you are given. If it doesn't answer the question, say you don't know yet.
+- Put a source tag right after each fact, copied exactly from the evidence line it came from: [Seen on your visit], [Tracker Radar], [Privacy policy], [HIBP], [CA Broker Registry], [Cookie Database], [RegTrack], [State Media Monitor] or [Government list]. Never invent other tags.
+- Write button and menu names in quotes ("Reject all"), never in square brackets: square brackets are only for the source tags above.
+- When asked what a site collects, list the cookies by purpose, name 2 or 3 advertising cookies with their company and how long they last, say which ones the site doesn't need to work, and mention device fingerprinting if present.
+- If a site had a data breach [HIBP], say when, how many accounts and what kind of data, and tell the person to change that password. Scraped or leaked data listed with [HIBP] counts as a breach too: never say you have no information about it.
+- A breach is what leaked from a site's accounts in the past, not what the site collects about you: never give a breach as the reason a site collects data.
+- If the person says yes to something you offered earlier, give it now from the evidence. Never claim you already told them something that isn't in your earlier answer. No backticks, no markdown, no lists with symbols.
+- When cookies or cookie banners come up, you may quote one RegTrack fact. RegTrack only compared doing nothing with clicking accept-all, so never say rejecting removes a number of trackers.
+- A company's home country is a concern only if it's on the foreign-adversary list in the evidence; never suggest the United States or any other country is a risk.
+- Never say data was sent to a government. A tracker loading means the company could collect data; it doesn't prove the data was sold or shared.
+- Don't mention sample data; the dashboard already says so.
+- You don't know which site the person has open right now. Don't say "you are currently visiting".
+
+Examples
+Question: What is a tracker?
+Answer: A tracker is a piece of code from another company that a site loads, so that company can see your visit and recognize you on other sites. [Tracker Radar] On your visits, 3 of the sites you visited loaded trackers from Criteo. [Seen on your visit]
+
+Question: Who tracked me the most this week?
+Answer: Google did: its trackers were on 7 of your 9 sites. [Seen on your visit] Next were Facebook on 5 of your 9 sites and Criteo on 3. [Seen on your visit]
+
+Question: Who is Criteo and should I worry?
+Answer: Criteo is an advertising company based in France. [Tracker Radar] Its tracker loaded on 3 of the sites you visited, including dailynews.example. [Seen on your visit] That lets it recognize you across those sites to show you ads. What you can do: decline extra cookies when Aegis offers, and turn on "Block third-party cookies" in Chrome settings.`;
+
+  // Short, checked facts Gemma may use for general questions. Each one carries its source tag.
+  const BACKGROUND = `Background facts:
+- About you, Aegis: your answers are written by Gemma 4 (Google's open AI model, released March 31, 2026), running on the person's own computer, inside Chrome or in the Ollama app. Their questions and browsing never leave the computer. If asked, say so; never say you aren't made with Gemma.
+- The U.S. Commerce Department lists 'foreign adversary' countries in 15 CFR 7.4: China (including Hong Kong), Cuba, Iran, North Korea, Russia and Venezuela. [Government list]
+- China's 2017 National Intelligence Law (Article 7) says organizations must support and cooperate with state intelligence work, so Chinese companies may be legally unable to refuse a government request for data they hold. [Government list]
+- Russia's 2016 "Yarovaya" laws require internet and phone companies to store users' data and hand it to security services on request, and a 2015 law requires Russians' personal data to be stored inside Russia. [Government list]
+- The Pentagon's Section 1260H list (updated June 8, 2026) names Chinese military companies. Baidu, Alibaba and Tencent are on it; ByteDance (TikTok) and Yandex are not. Being listed is a government designation about the company; it doesn't show what happened to your data. [Government list]
+
+- Every request to a tracker sends your IP address (which shows your rough location), the address of the page you're on, and your browser and device details. Cookies let the tracker recognize you again next time.
+- Cookies marked "advertising and profiling" or "measures your visits" are not needed for a site to work. Advertising cookies build a profile of your interests that ad companies use to target you; registered data brokers sell profiles like these.
+
+Steps the person can take (no tag needed):
+- Only on a site whose cookie banner has a reject option: let Aegis decline non-essential cookies ("Protect me"), or click that option yourself.
+- In Chrome, Settings > Privacy and security > Third-party cookies > Block third-party cookies.
+- Avoid entering personal details (name, email, phone, payment) on sites with an F grade or a foreign-adversary flag.
+- Use a tracker-blocking browser extension.
+- After visiting a site with no cookie banner or no reject option: clear that site's data with the "Clear" button in Aegis One's pop-up, so it can't link your next visit to this one.
+- Check the site's privacy policy for "sell" or "share" before creating an account.
+- After a site's data breach: change that password, and the same password anywhere else you used it; turn on two-step sign-in; watch for emails that pretend to be that site.`;
+
+  function fmtCount(n) { return n >= 1e6 ? `${(n / 1e6).toFixed(1)} million` : n >= 1e3 ? `${Math.round(n / 1e3)} thousand` : String(n); }
+  function breachText(b) {
+    return `data breach on ${b.breachDate} (added to Have I Been Pwned ${b.addedDate}): ${fmtCount(b.pwnCount)} accounts; exposed ${b.dataClasses.join(", ").toLowerCase()} [HIBP]`;
+  }
+
+  // Companies checked as NOT on the 1260H list ("ByteDance (TikTok)" -> ByteDance, TikTok), from the same file.
+  function notListed(extra) {
+    const n = extra && extra.flagged && extra.flagged.notOnThisList;
+    return ((n && n.companies) || []).map((c) => ({ label: String(c), names: String(c).replace(/\)/g, "").split(/\s*\(\s*/).filter(Boolean) }));
+  }
+  const mentions = (text, name) => new RegExp(`(^|[^a-z0-9])${name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}([^a-z0-9]|$)`, "i").test(text);
+  // Gemma 4 E2B said "ByteDance is also listed on the Pentagon's Section 1260H list" although the evidence says it isn't
+  // (G14, 2026-10-25). The question's own companies get a plain line either way, right next to the question.
+  function listingFacts(q, extra) {
+    const out = [];
+    for (const c of notListed(extra)) if (c.names.some((n) => mentions(q, n))) out.push(`- ${c.label} is not on the Pentagon's Section 1260H list of Chinese military companies (June 2026); a company can still count as a foreign-adversary link through its country [Government list]`);
+    for (const c of (extra && extra.flagged && extra.flagged.companies) || []) if (mentions(q, c.atlasCompany)) out.push(`- ${c.atlasCompany} is on the Pentagon's Section 1260H list of Chinese military companies (June 2026)${/sued|contest/i.test(c.note || "") ? `, which it is contesting in court` : ""} [Government list]`);
+    return out;
+  }
+  // ...and a sentence that still puts a checked not-listed company on that list is taken out, also when it calls the
+  // question's company "they" or "it" ("Who is ByteDance?": "...they are listed on the Pentagon's Section 1260H list", G14).
+  const PRONOUN = /\b(?:it|it's|its|they|they're|their|the company|this company)\b/i;
+  function dropFalseListings(text, extra, q) {
+    const names = notListed(extra).flatMap((c) => c.names);
+    if (!names.length || !/1260H/i.test(text)) return text;
+    const listed = ((extra && extra.flagged && extra.flagged.companies) || []).map((c) => c.atlasCompany);
+    const theirs = names.some((n) => mentions(q || "", n)) && !listed.some((n) => mentions(q || "", n));
+    const wrong = (x) => /1260H/i.test(x) && !DENIES.test(x) && (names.some((n) => mentions(x, n)) || (theirs && PRONOUN.test(x) && !listed.some((n) => mentions(x, n))));
+    return text.split("\n").map((par) => par.split(/(?<=[.!?](?:\s*\[[^\]]+\])*)\s+(?!\[)/).filter((x) => !wrong(x)).join(" ")).join("\n").trim();
+  }
+
+  // 1260H entry for a tracker's company, from shared/flagged-companies.json (hand-checked).
+  function listedCompany(company, extra) {
+    const list = extra && extra.flagged && extra.flagged.companies;
+    return (list && company && list.find(c => c.atlasCompany.toLowerCase() === String(company).toLowerCase())) || null;
+  }
+  function listedText(entry) {
+    return `, on the Pentagon's Section 1260H list of Chinese military companies (June 2026)` +
+      (/sued|contest/i.test(entry.note || "") ? `, and ${entry.atlasCompany} is contesting this in court` : "") + ` [Government list]`;
+  }
+
+  // RegTrack findings, from shared/regtrack-facts.json (each with its page number).
+  function regtrackLines(extra) {
+    const r = extra && extra.regtrack;
+    if (!r || !r.facts) return "";
+    const lines = r.facts.filter(f => f.id !== "limits").map(f => `- ${f.text} (RegTrack, ${r.venue.includes("MADWeb") ? "MADWeb 2026" : "2026"}, p. ${f.page}) [RegTrack]`);
+    return `\n\nResearch on cookie consent (RegTrack, a 2026 study of 743 websites; it did not measure rejecting, only doing nothing versus clicking accept-all):\n${lines.join("\n")}`;
+  }
+
+  // What the site's privacy policy says (filled by background/policy-reader.js). Unknown answers are left out, never stated.
+  const POLICY_FACTS = [
+    ["optOut", "explains how to opt out of sale or sharing", "gives no way to opt out of sale or sharing"],
+    ["gpc", "says it honors Global Privacy Control", "says it ignores browser opt-out signals like Global Privacy Control"],
+    ["retention", "gives a time limit for keeping your data", "has no time limit for keeping your data"],
+    ["preciseLocation", "collects your precise location", "uses only your rough location"],
+    ["sensitive", "collects sensitive information such as health, biometric or financial details", "says it doesn't collect sensitive information"],
+    ["otherSources", "gets data about you from other companies such as data brokers or ad partners", "says it only collects data directly from you"]
+  ];
+  function policyText(p) {
+    const quote = (f) => (p.quotes && p.quotes[f] ? ` ("${String(p.quotes[f]).slice(0, 200)}")` : "");
+    let main;
+    if (p.sells === true) main = `says it sells personal info${quote("sells")} [Privacy policy]`;
+    else if (p.shares === true) main = `says it shares with partners${p.checkedAt ? " for advertising" : ""}${quote("shares")} [Privacy policy]`;
+    else if (p.sells === false && p.shares === false) main = `says it doesn't sell or share${quote("sells")} [Privacy policy]`;
+    // The reader answers each question on its own, so one "no" with the other unknown is common: keep the quoted "no".
+    else if (p.sells === false) main = `says it doesn't sell personal info${quote("sells")}; it doesn't say clearly whether it shares [Privacy policy]`;
+    else if (p.shares === false) main = `says it doesn't share with partners${quote("shares")}; it doesn't say clearly whether it sells [Privacy policy]`;
+    else if (p.checkedAt) main = `read on ${String(p.checkedAt).slice(0, 10)}, no clear answer about selling or sharing [Privacy policy]`;
+    else return "not reviewed yet";
+    const more = POLICY_FACTS.filter(([f]) => p[f] === true || p[f] === false)
+      .map(([f, yes, no]) => `${p[f] ? yes : no}${quote(f)} [Privacy policy]`);
+    return [main, ...more].join("; it ");
+  }
+
+  // F2: the site itself is a state-run outlet (shared/state-media.json, via background/tracking.js).
+  const COUNTRY_NAMES = { CN: "China", RU: "Russia", IR: "Iran", CU: "Cuba", KP: "North Korea", VE: "Venezuela" };
+  // Every other code (US, FR, GB...) by its English name, so Gemma never answers "based in RU" (docs/ASKC-FIXES.md Fix 4).
+  let REGIONS = null;
+  try { REGIONS = new Intl.DisplayNames(["en"], { type: "region" }); } catch (e) { /* very old browser: codes stay */ }
+  function countryName(c) {
+    if (!c) return c;
+    if (COUNTRY_NAMES[c]) return COUNTRY_NAMES[c];
+    if (c === "HK") return "Hong Kong (China)";
+    try { return (REGIONS && REGIONS.of(c)) || c; } catch (e) { return c; }
+  }
+  function stateMediaText(owner) {
+    const sm = owner && owner.stateMedia;
+    if (!sm) return "";
+    const kind = { SC: "State-Controlled", CaPu: "Captured Public (state-managed)" }[sm.classification] || "state media";
+    return `; the site itself is state-run media: ${owner.company} (${COUNTRY_NAMES[owner.country] || owner.country}), classified ${kind} by State Media Monitor (${String(sm.updated || "").slice(0, 4) || "2026"}) [State Media Monitor]`;
+  }
+
+  const TRACKERS_SHOWN = 12;   // tracker companies listed per site in full detail
+  // The site's cookie banner in plain words: Gemma read the codes ("cookies no-reject", "cookies none") as anything and
+  // told people to click "Reject all" on zara.com, which showed no banner (G14 audit, 2026-10-24).
+  const BANNER_WORDS = { declined: "you declined non-essential cookies", accepted: "you accepted all cookies",
+                         "no-reject": "had no reject option", none: "none seen" };
+
+  function siteLine(s, extra) {
+    // The same company often loads several tracker addresses on one page: say it once, with how many.
+    const count = new Map();
+    for (const x of s.trackers || []) {
+      const listed = listedCompany(x.company, extra);
+      const text = `${x.company} (${x.category}, based in ${x.country ? countryName(x.country) : "unknown country"}) [Tracker Radar]` +
+        (listed ? listedText(listed) : "") +
+        (x.broker ? `, registered California data broker [CA Broker Registry]` : "");
+      count.set(text, (count.get(text) || 0) + 1);
+    }
+    // Long lists are cut to the ones that matter most (foreign-adversary or 1260H links, brokers, advertising first).
+    const rank = (text) => (/1260H|based in (China|Hong Kong \(China\)|Russia|Iran|Cuba|North Korea|Venezuela)\)/.test(text) ? 0
+      : /data broker|\((High-risk|Malware),/i.test(text) ? 1 : /\((Advertising|Data broker|Session recording),/.test(text) ? 2 : 3);
+    const entries = [...count].map(([text, n], i) => ({ text: n > 1 ? `${text} (${n} tracker addresses)` : text, co: text.slice(0, text.indexOf(" (")), r: rank(text), i }));
+    const kept = entries.length > TRACKERS_SHOWN ? [...entries].sort((a, b) => a.r - b.r || a.i - b.i).slice(0, TRACKERS_SHOWN).sort((a, b) => a.i - b.i) : entries;
+    const keptCos = new Set(kept.map(e => e.co));
+    const leftOut = new Set(entries.filter(e => !keptCos.has(e.co)).map(e => e.co)).size;
+    const t = kept.map(e => e.text).join("; ") + (leftOut ? `; and ${leftOut} more tracker compan${leftOut === 1 ? "y" : "ies"}` : "") || "none";
+    const p = s.policy || {};
+    const pol = policyText(p);
+    const day = s.lastVisit ? String(s.lastVisit).slice(0, 10) : "unknown date";
+    const br = s.breach ? `; ${breachText(s.breach)}` : "";
+    const C = (typeof window !== "undefined" ? window : self).AegisCookies;
+    let ck = "";
+    if (s.cookies && s.cookies.length && C) {
+      const sum = C.summarize(s.cookies);
+      const byLabel = new Map();   // "Functional" and "Necessary" share a label: count them together
+      for (const [k, n] of Object.entries(sum.byCategory)) { const label = C.KIND[k] ? C.KIND[k].label : "purpose unknown"; byLabel.set(label, (byLabel.get(label) || 0) + n); }
+      const parts = [...byLabel].map(([label, n]) => `${n} ${label}`);
+      const ads = sum.marketing.slice(0, 4).map(c => `${c.name} (${c.company || c.domain}, kept ${C.lifetime(c.days)}${c.firstParty ? "" : ", third-party"})`).join(", ");
+      ck = `; cookies stored: ${sum.total} (${parts.join(", ")}) [Seen on your visit] [Cookie Database]` +
+        (ads ? `; advertising cookies: ${ads} [Cookie Database]` : "") +
+        `; ${sum.unneededCount} of them aren't needed for the site to work [Cookie Database]`;
+    }
+    const fp = (s.trackers || []).filter(x => (x.fingerprinting || 0) >= 2).map(x => x.company);
+    const smText = stateMediaText(s.owner);
+    const fpText = fp.length ? `; trackers that read device details to recognize you without cookies (fingerprinting): ${[...new Set(fp)].join(", ")} [Tracker Radar]` : "";
+    return `- ${s.domain}, visited ${day}: grade ${s.grade}${gradeWords(s.grade)}, exposure ${s.score}/100, cookie banner: ${BANNER_WORDS[s.cookieChoice] || BANNER_WORDS.none} [Seen on your visit]; trackers seen [Seen on your visit]: ${t}; this site's own privacy policy ${pol}${br}${ck}${fpText}${smText}${scoreText(s)}`;
+  }
+
+  // " (Some exposure)": the grade's own words, as the popup and grade box show them, so Gemma doesn't guess them.
+  function gradeWords(g) {
+    const D = (typeof window !== "undefined" ? window : self).AegisData;
+    const w = D && D.GRADE_WORDS && D.GRADE_WORDS[g];
+    return w ? ` (${w})` : "";
+  }
+  // What adds up to a site's exposure score (the popup's "Why it got a B" lines), from shared/data.js.
+  const PART_TAG = { observed: "Seen on your visit", disclosed: "Privacy policy", breach: "HIBP" };
+  function scoreParts(s) {
+    const D = (typeof window !== "undefined" ? window : self).AegisData;
+    if (!D || !D.computeScore) return null;
+    const r = D.computeScore(s);
+    return { ...r, counted: r.parts.filter(p => p.points > 0).sort((a, b) => b.points - a.points) };
+  }
+  function scoreText(s) {
+    const r = scoreParts(s);
+    if (!r) return "";
+    return `; score made of: ${r.counted.map(p => `${p.label} (+${p.points}) [${PART_TAG[p.kind] || PART_TAG.observed}]`).join(", ") || "nothing counted"}`;
+  }
+
+  // Tracker Radar totals per company (domains, main category, country, biggest reach). Built once per Atlas.
+  const COMPANIES = new WeakMap();
+  function companiesOf(atlas) {
+    let byCo = COMPANIES.get(atlas);
+    if (byCo) return byCo;
+    byCo = {};
+    for (const [d, [co, cat, ctry, prev]] of Object.entries(atlas.domains)) {
+      const x = byCo[co] || (byCo[co] = { n: 0, cats: {}, ctry, prev: 0, top: d });
+      x.n++; x.cats[cat] = (x.cats[cat] || 0) + 1; if (prev > x.prev) { x.prev = prev; x.top = d; }
+    }
+    COMPANIES.set(atlas, byCo);
+    return byCo;
+  }
+
+  // ---------- Data breaches (Have I Been Pwned), docs/ASKC-FIXES.md ----------
+  // "Was linkedin.com hacked?" (real Gemma, 2026-10-24): Aegis only ever saw a site's newest breach, matched only by its
+  // web address or breach name, so "Was LinkedIn hacked?" or "linked in" found nothing and the 2012 hack was missed.
+  const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+  const MONTHS_LONG = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
+  function monthYear(iso) { const [y, m] = String(iso || "").split("-"); return m ? `${MONTHS_LONG[+m - 1]} ${y}` : (y || "date unknown"); }
+  // Words that are also the names of breached sites but almost always mean the word itself.
+  const BREACH_STOP = new Set(["data", "cookie", "cookies", "privacy", "tracker", "trackers", "account", "accounts", "email", "password",
+    "passwords", "game", "games", "chat", "mail", "news", "online", "best", "free", "shop", "phone", "info", "home", "music", "video",
+    "social", "dating", "forum", "health", "money", "bank", "cloud", "site", "sites", "website", "breach", "hacked", "leak", "past",
+    "tell", "about", "what", "which", "have", "been", "them", "their", "with", "from", "this", "that", "yes", "okay",
+    "crypto", "exchange", "wallet", "school", "phone", "photos", "photo", "camera", "computer", "laptop", "router", "wifi", "work",
+    "company", "store", "shopping", "streaming", "browser", "device", "server", "network", "credit", "card", "identity"]);
+
+  // Sites in the breach list that the question means: by web address ("linkedin.com"), by name ("LinkedIn",
+  // "linked in", "Ashley Madison"). At most 3, in the order found.
+  function breachSites(question, lists) {
+    const by = lists && lists.hibp && lists.hibp.byDomain;
+    if (!by) return [];
+    const q = String(question || "").toLowerCase();
+    const domains = (q.match(/[a-z0-9-]+(?:\.[a-z0-9-]+)+/g) || []).map((d) => d.replace(/^www\./, ""));
+    const words = q.replace(/[a-z0-9-]+(?:\.[a-z0-9-]+)+/g, (d) => d.replace(/^www\./, "").split(".")[0]).match(/[a-z0-9]+/g) || [];
+    const names = new Set(words);
+    // "linked in" -> "linkedin", "my space" -> "myspace": only when the second word is short, so ordinary words never fuse.
+    for (let i = 0; i + 1 < words.length; i++) if (words[i + 1].length <= 3) names.add(words[i] + words[i + 1]);
+    const L = (typeof window !== "undefined" ? window : self).AegisLists;
+    const nq = L ? " " + L.norm(question) + " " : "";
+    const named = (n) => { const x = L ? L.norm(n) : ""; return x.length >= 5 && !BREACH_STOP.has(x) && nq.includes(" " + x + " "); };
+    const hits = [];
+    for (const [d, b] of Object.entries(by)) {
+      const n = siteName(d);
+      if (domains.includes(d) || (n.length >= 4 && !BREACH_STOP.has(n) && !COMMON_WORDS.has(n) && names.has(n)) || named(b.title) ||
+          [b, ...(b.earlier || [])].some((x) => named(x.name))) hits.push([d, b]);
+      if (hits.length >= 3) break;
+    }
+    return hits;
+  }
+
+  // Every breach on record for a site, newest first: [{ when, title, count, kinds }].
+  function breachList(b) {
+    return [b, ...(b.earlier || [])].sort((x, y) => (String(x.breachDate) < String(y.breachDate) ? 1 : -1)).map((x) => ({
+      when: monthYear(x.breachDate), title: x.title || x.name,
+      count: x.pwnCount ? `${fmtCount(x.pwnCount)} accounts` : "number of accounts not given",
+      kinds: (x.dataClasses || []).join(", ").toLowerCase()
+    }));
+  }
+  function siteLabel(d, b) {   // the shortest title is usually the company itself ("LinkedIn", not "LinkedIn Scraped Data (2021)")
+    const titles = [b, ...(b.earlier || [])].map((x) => x.title || x.name).filter(Boolean).sort((x, y) => x.length - y.length);
+    return `${titles[0] || d} (${d})`;
+  }
+  function breachHead(d, b) {
+    const n = 1 + ((b.earlier && b.earlier.length) || 0);
+    return `${siteLabel(d, b)} has ${n} data breach${n > 1 ? "es" : ""} on record in Have I Been Pwned`;
+  }
+  // "Was X hacked?" answered from the list itself (like grade questions): every breach, exact numbers, no guessing.
+  const BREACH_Q = /\b(hack\w*|breach\w*|leak\w*|pwn\w*|compromis\w*|stolen|hibp)\b/i;
+  const FOLLOW_UP = /\b(it|its|it's|they|them|their|that|this|those|yes|yeah|yep|ok|okay|sure|please)\b/i;
+  // Companies the tracker data knows ("Google"), named in the question as whole words.
+  function namedCompanies(question, atlas) {
+    return atlas && atlas.domains ? companiesIn(question, Object.keys(companiesOf(atlas))).slice(0, 2) : [];
+  }
+  // The one way every part of Aegis finds the companies a question names (facts, sites shown in full, breach answers).
+  // Backtest 2026-10-24: three different matchers meant "Who is Amazon?" found no facts while "Was Amazon hacked?"
+  // did, "Who is Meta?" found nothing (Tracker Radar calls it Facebook), and "Did any site I visit get hacked?"
+  // was answered about a tracker company named VISIT.
+  const COMPANY_ALIASES = { meta: "Facebook", "meta platforms": "Facebook", instagram: "Facebook", whatsapp: "Facebook",
+    alphabet: "Google", youtube: "Google", tiktok: "ByteDance", linkedin: "Microsoft", bing: "Microsoft",
+    yahoo: "Verizon Media", aol: "Verizon Media", snapchat: "Snap", amazon: "Amazon.com", verizon: "Verizon Media" };
+  // Company names that are everyday words: they count only when written the way the company writes them, not first.
+  const EVERYDAY_NAMES = new Set(["visit", "next", "impact", "about you", "answers", "insider", "move", "near", "optimize", "orange",
+    "polar", "smile", "stamped", "uplift", "indeed", "increasingly", "narrative", "stuff", "epic", "affinity", "iterate", "institute",
+    "herald", "maverick", "terminus", "consumable", "radial", "admiral", "agora", "arbitrage", "triumphant", "seattle", "quant", "plex", "fomo",
+    // Found with English word frequencies over every Tracker Radar company (2026-10-24): "how do I block trackers?" named Block, Inc.
+    "block", "news", "reach", "progressive", "leaf", "snap", "valve", "anthem", "booking", "singular", "oracle", "staples", "flux", "sony"]);
+  const escapeRe = (x) => x.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  function companiesIn(question, names) {
+    const L = (typeof window !== "undefined" ? window : self).AegisLists;
+    if (!L || !question) return [];
+    const raw = String(question);
+    const nq = " " + L.norm(raw) + " ";
+    const known = new Set(names);
+    const full = [], first = [];
+    for (const [alias, co] of Object.entries(COMPANY_ALIASES)) if (known.has(co) && nq.includes(" " + alias + " ")) full.push(co);
+    for (const co of names) {
+      const n = L.norm(co);
+      if (n.length >= 4 && !BREACH_STOP.has(n) && nq.includes(" " + n + " ")) {
+        if (EVERYDAY_NAMES.has(n)) { const m = new RegExp(`(^|[^A-Za-z])${escapeRe(co)}(?![A-Za-z])`).exec(raw); if (!m || m.index + m[1].length === 0) continue; }
+        full.push(co);
+      } else {   // "Lotame Solutions" also answers to "Lotame"; generic first words ("Digital", "Global") never do. Many first
+        // words are everyday words too ("Better Commerce", "Improve Digital", "Index Exchange"), so the first word counts only
+        // written with its capital, and not as the question's first word ("How can I make it better?" names no company).
+        const w = n.split(" ")[0];
+        const word = String(co).split(/[^A-Za-z0-9]/)[0];
+        if (w !== n && w.length >= 5 && !BREACH_STOP.has(w) && !GENERIC_FIRST.has(w) && /^[A-Z]/.test(word) &&
+            new RegExp(`[^A-Za-z]${escapeRe(word)}(?![A-Za-z])`).test(raw)) first.push(co);
+      }
+    }
+    return [...new Set([...full, ...first.sort((x, y) => x.length - y.length)])];
+  }
+  const GENERIC_FIRST = new Set(["digital", "media", "global", "network", "networks", "group", "systems", "technologies", "technology",
+    "solutions", "services", "software", "interactive", "mobile", "marketing", "analytics", "labs", "internet", "united", "american",
+    "national", "international", "first", "smart", "cloud", "online", "social", "advanced", "audience", "trade", "direct", "content",
+    "video", "local", "north", "south", "east", "west", "china", "beijing", "shanghai", "russia", "new", "general", "public", "power",
+    // Country names: "based in France" names no company (not "France Medias Monde").
+    "france", "germany", "japan", "india", "canada", "britain", "england", "ireland", "israel", "italy", "spain", "korea", "brazil",
+    "mexico", "australia", "netherlands", "sweden", "norway", "denmark", "finland", "poland", "turkey", "ukraine", "singapore", "taiwan",
+    "europe", "european", "asia", "africa", "america", "swiss", "french", "german", "japanese", "chinese", "russian", "british"]);
+
+  const MORE_Q = /\b(more|else|again|why|how so|explain)\b/i;
+  // A subject of its own: a question with one of these is about it, not about the last question's company.
+  const OWN_TOPIC = /\b(fingerprint\w*|trackers?|tracking|cookies?|ads?|advert\w*|brokers?|breach\w*|hack\w*|grades?|polic(?:y|ies)|vpn|incognito|aegis\w*|data|gemma|banners?|pop-?ups?|1260h)\b/i;
+  const AND_ABOUT = /^\s*(?:and|what about|how about|same for|also)\b/i;
+  // sites = your browsing (data.sites), atlas = tracker data: so a name Aegis One knows gets an answer even without a breach.
+  function breachAnswer(q, lists, history, sites, atlas, now) {
+    if (!(lists && lists.hibp && lists.hibp.byDomain)) return null;
+    const last = recent(history).slice(-1)[0];
+    const lastWasBreach = !!(last && BREACH_Q.test(last.question));
+    if (!BREACH_Q.test(q) && !(lastWasBreach && AND_ABOUT.test(q))) return null;   // "what about google?" after a breach question
+    // "What sites have I been to that have had recent data breaches?" is about your own sites, whatever else its words
+    // match: it was answered about a breach named "Recent" on a site never visited (Preston, Oct 25). Your sites first.
+    if (BREACH_Q.test(q) && MY_SITES.test(q) && !/[a-z0-9-]+\.[a-z]{2,}/i.test(q) && !namedSites(sites || [], q).length && !namedCompanies(q, atlas).length) {
+      return yourBreaches(lists, sites || [], q, now || Date.now());
+    }
+    let hits = breachSites(q, lists);
+    if (!hits.length && FOLLOW_UP.test(q) && last && !AND_ABOUT.test(q)) hits = breachSites(last.question, lists);   // "yes, its breaches"
+    // "Check the ive been pwned list" names nothing: it means the last question's site or company (PLAN R19g).
+    const namesNothing = (x) => !breachSites(x, lists).length && !/[a-z0-9-]+\.[a-z]{2,}/i.test(x) && !namedSites(sites || [], x).length && !namedCompanies(x, atlas).length;
+    // "what about quest diagnostics?" names something new, even when Aegis One doesn't know the name: it got the last
+    // question's site (LinkedIn) back (Max, real Gemma, 2026-10-25). Only "what about it/them/that?" means the last one.
+    const wasHacked = q.match(/^\s*(?:was|were|has|have|did|is)\s+(.{2,40}?)\s+(?:ever\s+)?(?:been\s+|get\s+|got\s+)?(?:hacked|breached|pwned|leaked|compromised)\s*[?.!]*\s*$/i);
+    const asksAbout = AND_ABOUT.test(q) ? q.replace(AND_ABOUT, "").replace(/[?.!,\s]+$/, "").trim() : wasHacked ? wasHacked[1].trim() : "";
+    const newThing = asksAbout && !FOLLOW_UP.test(asksAbout) && /[a-z]{3,}/i.test(asksAbout);
+    const newName = newThing && asksAbout.split(/\s+/).length <= 5 && !/\b(?:how|why|what|when|where|who|which|should|can|could|do|does|did|is|are|was|were|my|me|mine|i|you|your|we|our)\b/i.test(asksAbout)
+      ? (asksAbout === asksAbout.toLowerCase() ? asksAbout.replace(/\b[a-z]/g, (c) => c.toUpperCase()) : asksAbout) : "";
+    if (!hits.length && last && namesNothing(q) && !MY_SITES.test(q) && !newThing) { hits = breachSites(last.question, lists); if (!hits.length) q = last.question; }
+    if (hits.length) {
+      const parts = hits.map(([d, b]) => `${breachHead(d, b)} [HIBP]:\n` +
+        breachList(b).map((x) => `- ${x.when}, ${x.title}: ${x.count}${x.kinds ? `; exposed ${x.kinds}` : ""}.`).join("\n"));
+      const who = hits.length === 1 ? siteLabel(hits[0][0], hits[0][1]).replace(/ \(.*$/, "") : "one of these sites";
+      return parts.join("\n\n") + `\n\nWhat you can do: if you have a ${who} account, change its password and the same password anywhere ` +
+        `else you used it, turn on two-step sign-in, and watch for emails pretending to be ${hits.length === 1 ? who : "these sites"}.`;
+    }
+    const domain = (q.toLowerCase().match(/[a-z0-9-]+(?:\.[a-z0-9-]+)+/) || [])[0];
+    const visited = namedSites(sites || [], q)[0];
+    const company = namedCompanies(q, atlas)[0];
+    // "Did any site I visit get hacked?", "Which of my sites leaked data?": your own sites, from the same list (backtest
+    // 2026-10-24: six wordings went three different ways, one answered about a tracker company named VISIT).
+    if (!domain && !visited && !company && MY_SITES.test(q)) return yourBreaches(lists, sites || [], q, now || Date.now());
+    // No breach on record. Say so for anything Aegis One knows: a web address, a site you visited, or a tracker company.
+    // "Was google hacked?" is about Google, not docs.google.com (a page of it you visited); "docs.google.com" names the page.
+    const pageOfCompany = visited && company && visited.domain.split(".").length > 2;
+    const subject = domain ? domain.replace(/^www\./, "") : visited && !pageOfCompany ? visited.domain : company ? companyLabel(q, company) : newName || null;
+    if (!subject) return null;   // nothing Aegis One knows: Gemma answers from the rest of the evidence
+    const at = String(lists.hibp.fetchedAt || "").slice(0, 10).split("-");
+    const updated = at.length === 3 ? ` (updated ${MONTHS[+at[1] - 1]} ${+at[2]}, ${at[0]})` : "";
+    let seen = "";
+    if (company && !domain && !visited) {
+      const on = (sites || []).filter((s) => (s.trackers || []).some((t) => t && t.company === company)).length;
+      if (on) seen = ` ${company}'s trackers were on ${on} of your ${sites.length} sites this week [Seen on your visit], which is about tracking, not a breach.`;
+    }
+    return `Have I Been Pwned's list${updated} has no breach on record for ${subject} [HIBP]. ` +
+      "That doesn't prove it was never breached: the list only has breaches that became public." + seen +
+      "\n\nWhat you can do: use a different password for each site and turn on two-step sign-in, so one breach can't unlock your other accounts.";
+  }
+
+  // Breach claims Gemma can't back (real Gemma on the G14, 2026-10-25: "Zara.com also had a data breach recently"
+  // after a LinkedIn question, with no Zara breach on the list). A sentence saying a named site or company was
+  // breached, hacked or leaked stays only when the breach list has it. Sentences that say there was no breach, or
+  // explain what a breach is, name nobody and stay.
+  const BREACH_CLAIM = /\b(?:had|has|have|suffered|experienced|was|were|been|got)\b[^.!?]*\b(?:breach\w*|hack\w*|leak\w*|pwn\w*|compromis\w*)/i;
+  const DENIES = /\b(?:no|not|never|none)\b|n't\b/i;
+  const NAMES_SOMEONE = /[a-z0-9-]+\.[a-z]{2,}\b|(?:^|\s)(?!(?:A|An|The|This|That|It|Its|You|Your|Aegis|I|If|When|Some|Many|Most|Any|Each|Every|One|They|Their|There|These|Those|What|In|On|At|Since|After|Before|Also|And|But|So|Yes|No)\b)[A-Z][A-Za-z0-9]+/;
+  function dropUnbackedBreaches(text, lists) {
+    // A sentence keeps the source tags that follow it ("... passwords. [HIBP] Zara.com ...").
+    return String(text || "").split("\n").map((par) => par.split(/(?<=[.!?](?:\s*\[[^\]]+\])*)\s+(?!\[)/).filter((sentence) => {
+      if (!BREACH_CLAIM.test(sentence) || DENIES.test(sentence) || breachSites(sentence, lists).length) return true;
+      return !NAMES_SOMEONE.test(sentence.replace(/\[[^\]]*\]/g, ""));
+    }).join(" ")).join("\n");
+  }
+
+  // "Which site tracks me the most?" is about a site, not a company (real Gemma answered "Google" and then listed
+  // Google again among the others). Counted from your browsing, so every wording gets the same answer.
+  const and = (xs) => (xs.length > 1 ? `${xs.slice(0, -1).join(", ")} and ${xs[xs.length - 1]}` : xs[0] || "");
+  const MOST_SITE = /\b(?:which|what)\s+(?:of\s+my\s+)?(?:web)?sites?\b[^?]*\bmost\b|\bmost[-\s]+tracked\s+(?:web)?sites?\b/i;
+  function mostTrackedAnswer(q, sites) {
+    if (!MOST_SITE.test(q) || !/\btrack/i.test(q)) return null;
+    if (!sites.length) return "You haven't visited any sites with Aegis One on yet, so there's no site to name yet.";
+    const count = (s) => (s.trackers || []).filter(Boolean).length;
+    const ranked = sites.filter(count).sort((a, b) => count(b) - count(a) || (b.score || 0) - (a.score || 0) || (a.domain < b.domain ? -1 : 1));
+    if (!ranked.length) return `None of the ${sites.length} sites you visited in the last 7 days loaded a tracker Aegis One knows [Seen on your visit].`;
+    const many = (n, word) => `${n} ${word}${n === 1 ? "" : "s"}`;
+    const top = ranked[0];
+    const cos = [...new Set(top.trackers.filter(Boolean).map((t) => t.company).filter(Boolean))];
+    const named = cos.length > 5 ? `${cos.slice(0, 5).join(", ")} and ${cos.length - 5} more` : and(cos);
+    let text = `${top.domain} tracked you the most: it loaded ${many(count(top), "tracker")} from ${cos.length} ${cos.length === 1 ? "company" : "companies"}` +
+      `${named ? ` (${named})` : ""} [Seen on your visit].`;
+    const next = ranked.slice(1, 3);
+    if (next.length === 2 && count(next[0]) === count(next[1])) text += ` Next were ${and(next.map((s) => s.domain))}, with ${many(count(next[0]), "tracker")} each.`;
+    else if (next.length) text += ` Next ${next.length > 1 ? "were" : "was"} ${and(next.map((s) => `${s.domain} (${many(count(s), "tracker")})`))}.`;
+    return text;
+  }
+
+  const MY_SITES = /\b(?:web)?sites?\b|\bi\s+(?:visit|visited|went|use|go)\b|\bi(?:'ve|\s+have)\s+(?:been|gone|used|visited)\b|\bmy\s+(?:browsing|history)\b/i;
+  // "Recent" is Aegis One's own rule, the one the grade and the alerts use: added to Have I Been Pwned in the last 12 months.
+  const RECENT_Q = /\brecent(?:ly)?\b|\blately\b|\blatest\b|\bnew(?:est|er)?\b|\bthis\s+year\b|\b(?:last|past)\s+(?:year|12\s+months|twelve\s+months|few\s+months|months?)\b/i;
+  const YEAR_MS = 365.25 * 864e5;
+  const MY_BREACH_STEPS = "\n\nWhat you can do: if you have an account on one of these sites, change its password and the same password anywhere else you used it, " +
+    "turn on two-step sign-in, and watch for emails pretending to be that site.";
+  function yourBreaches(lists, sites, q, now) {
+    const by = lists.hibp.byDomain;
+    const hit = sites.map((s) => [s.domain, by[s.domain] || s.breach]).filter(([, b]) => b);
+    const updated = hibpUpdated(lists);
+    const isRecent = (x) => now - Date.parse(x.addedDate || x.breachDate) < YEAR_MS;
+    const all = (b) => [b, ...(b.earlier || [])].sort((x, y) => (String(x.breachDate) < String(y.breachDate) ? 1 : -1));
+    const item = (x) => `${monthYear(x.breachDate)}, ${x.title || x.name}: ${x.pwnCount ? `${fmtCount(x.pwnCount)} accounts` : "number of accounts not given"}${(x.dataClasses || []).length ? `; exposed ${x.dataClasses.join(", ").toLowerCase()}` : ""}`;
+    const clean = sites.length - hit.length;
+    const rest = clean ? `\nThe other ${clean === 1 ? "site you visited has" : `${clean} sites you visited have`} no breach on record. That doesn't prove they were never breached: the list only has breaches that became public.` : "";
+    if (q && RECENT_Q.test(q)) {   // "recent breaches on my sites": the recent ones, the older ones, and the rest
+      const newest = (xs) => xs.map((x) => String(x.addedDate || x.breachDate)).sort().pop();
+      const fresh = hit.map(([d, b]) => [d, all(b).filter(isRecent)]).filter(([, xs]) => xs.length)
+        .sort((a, b) => (newest(b[1]) > newest(a[1]) ? 1 : -1));   // the newest report first
+      const older = hit.map(([d, b]) => [d, all(b).filter((x) => !isRecent(x))]).filter(([, xs]) => xs.length);
+      const head = fresh.length
+        ? `${fresh.length} of the ${sites.length} sites you visited in the last 7 days had a data breach reported in the last 12 months, in Have I Been Pwned's list${updated} [HIBP]:\n` +
+          fresh.map(([d, xs]) => `- ${d}: ${xs.map((x) => `${item(x)} (added ${readOn(x.addedDate || x.breachDate)})`).join(". ")}.`).join("\n")
+        : `None of the ${sites.length} sites you visited in the last 7 days had a data breach reported in the last 12 months, in Have I Been Pwned's list${updated} [HIBP].`;
+      const old = older.length ? `\nOlder breaches on record for sites you visited: ${older.map(([d, xs]) => `${d} (${xs.map((x) => `${monthYear(x.breachDate)}, ${x.title || x.name}`).join("; ")})`).join(", ")}.` : "";
+      return head + old + rest + "\n\"Reported in the last 12 months\" means added to the list in that time, the same rule as Aegis One's grade and alerts." +
+        (fresh.length ? MY_BREACH_STEPS : "\n\nWhat you can do: use a different password for each site and turn on two-step sign-in, so one breach can't unlock your other accounts.");
+    }
+    if (!hit.length) return `None of the ${sites.length} site${sites.length === 1 ? "" : "s"} you visited in the last 7 days is in Have I Been Pwned's list${updated} [HIBP]. ` +
+      "That doesn't prove they were never breached: the list only has breaches that became public.";
+    return `${hit.length} of the ${sites.length} sites you visited in the last 7 days ${hit.length === 1 ? "is" : "are"} in Have I Been Pwned's list${updated} [HIBP]:\n` +
+      hit.map(([d, b]) => `- ${d}${all(b).some(isRecent) ? " (reported in the last 12 months)" : ""}: ` + all(b).map(item).join(". ") + ".").join("\n") +
+      rest + MY_BREACH_STEPS;
+  }
+
+  // ---------- One way to recognise names, however they're typed (PLAN R19g/R19i) ----------
+  // "tik tok", "you tube", "face book", "what's app" (two words run together) and "linkdin" (one typo) become the name
+  // Aegis One knows, before anything else reads the question, so every part of Aegis (facts, grades, breaches, "Is X safe?")
+  // recognises them the same way. Ordinary words never change: joins need a known name and never start with "my", "the"...;
+  // typos only fix the best-known names, never words ending like ordinary words ("tracked", "sharing").
+  const JOIN_STOP = new Set(["my", "your", "the", "a", "an", "our", "his", "her", "its", "their", "this", "that", "these", "those", "is", "it", "i", "me", "we"]);
+  const TYPO_STOP = new Set(["should", "website", "websites", "cookie", "cookies", "tracker", "trackers", "tracking", "privacy", "safety", "secure",
+    "hacked", "breach", "breaches", "breached", "leaked", "worried", "trusted", "online", "google", "people", "policy", "please", "things"]);
+  const POPULAR_PREV = 5;   // companies whose biggest tracker is on 5%+ of popular sites (Google, Facebook, Microsoft...)
+  const VOCAB = new WeakMap();
+  function nameVocab(sites, lists, atlas) {
+    const key = atlas || VOCAB;
+    const cached = VOCAB.get(key);
+    const sig = `${(sites || []).length}|${lists && lists.hibp ? Object.keys(lists.hibp.byDomain || {}).length : 0}`;
+    if (cached && cached.sig === sig) return cached;
+    const all = new Set(), popular = new Set();
+    const add = (w, pop) => { w = String(w || "").toLowerCase().replace(/[^a-z0-9]/g, ""); if (w.length >= 4) { all.add(w); if (pop && w.length >= 6) popular.add(w); } };
+    for (const a of Object.keys(COMPANY_ALIASES)) add(a, true);
+    for (const s of sites || []) add(siteName(s.domain), true);
+    if (lists && lists.hibp && lists.hibp.byDomain) for (const d of Object.keys(lists.hibp.byDomain)) add(siteName(d), false);
+    if (atlas && atlas.domains) for (const [co, x] of Object.entries(companiesOf(atlas))) { if (!/\s/.test(co.trim())) add(co, x.prev >= POPULAR_PREV); }
+    for (const w of [...BREACH_STOP, ...COMMON_WORDS, ...EVERYDAY_NAMES]) all.delete(w), popular.delete(w);
+    const v = { sig, all, popular };
+    VOCAB.set(key, v);
+    return v;
+  }
+  function oneEditApart(a, b) {
+    if (a === b || Math.abs(a.length - b.length) > 1) return a !== b && false;
+    let i = 0, j = 0, edits = 0;
+    while (i < a.length && j < b.length) {
+      if (a[i] === b[j]) { i++; j++; continue; }
+      if (++edits > 1) return false;
+      if (a.length > b.length) i++; else if (b.length > a.length) j++; else { i++; j++; }
+    }
+    return edits + (a.length - i) + (b.length - j) <= 1;
+  }
+  function fixNames(question, vocab) {
+    const q = String(question || "");
+    if (!vocab) return q;
+    const parts = q.match(/[A-Za-z0-9'’]+|[^A-Za-z0-9'’]+/g) || [];
+    const word = (p) => /^[A-Za-z0-9'’]+$/.test(p || "");
+    const low = (p) => String(p).toLowerCase().replace(/['’]/g, "");
+    const out = [];
+    for (let i = 0; i < parts.length; i++) {
+      const p = parts[i];
+      if (word(p) && /^\s+$/.test(parts[i + 1] || "") && word(parts[i + 2]) && !JOIN_STOP.has(low(p))) {
+        const joined = low(p) + low(parts[i + 2]);
+        if (joined.length >= 5 && vocab.all.has(joined) && !vocab.all.has(low(p))) { out.push(joined); i += 2; continue; }
+      }
+      if (word(p)) {
+        const w = low(p);
+        if (w.length >= 6 && !vocab.all.has(w) && !TYPO_STOP.has(w) && !/(?:ed|ing|ly|es|er|ers|tion|ment)$/.test(w)) {
+          const hit = [...vocab.popular].find((c) => c[0] === w[0] && oneEditApart(w, c));
+          if (hit) { out.push(hit); continue; }
+        }
+      }
+      out.push(p);
+    }
+    return out.join("");
+  }
+
+  // How to name a company the person asked about by another name: "TikTok (owned by ByteDance)", "Meta (Tracker Radar lists it as Facebook)".
+  const ALIAS_LABEL = { meta: "Meta", "meta platforms": "Meta Platforms", instagram: "Instagram", whatsapp: "WhatsApp", alphabet: "Alphabet",
+    youtube: "YouTube", tiktok: "TikTok", linkedin: "LinkedIn", bing: "Bing", yahoo: "Yahoo", aol: "AOL", snapchat: "Snapchat", amazon: "Amazon", verizon: "Verizon" };
+  const SAME_COMPANY = new Set(["meta", "meta platforms", "alphabet", "amazon", "verizon", "snapchat"]);
+  function askedAlias(question, company) {
+    const L = (typeof window !== "undefined" ? window : self).AegisLists;
+    const nq = " " + (L ? L.norm(question) : String(question).toLowerCase()) + " ";
+    return Object.keys(COMPANY_ALIASES).find((a) => COMPANY_ALIASES[a] === company && nq.includes(" " + a + " ")) || null;
+  }
+  function companyLabel(question, company) {
+    const a = askedAlias(question, company);
+    if (!a) return company;
+    if (a === "amazon" || a === "snapchat") return ALIAS_LABEL[a];
+    return SAME_COMPANY.has(a) ? `${ALIAS_LABEL[a]} (Tracker Radar lists it as ${company})` : `${ALIAS_LABEL[a]} (owned by ${company})`;
+  }
+  const shortLabel = (label) => label.replace(/ \(.*$/, "");
+
+  // ---------- "Is X safe?" from Aegis One's own records (PLAN R19h) ----------
+  // "Is YouTube safe?" (real Gemma, 2026-10-24) ignored YouTube's grade; "Is FaceBook safe?" made up a breach history.
+  // Like grade and breach questions, these are answered from the records: grade, what added points, flags, owner, the
+  // breach list. Never "safe" or "unsafe": Aegis One measures exposure, not malware or scams.
+  const SAFE_Q = /\b(safe|safely|unsafe|dangerous|danger|trust|trustworthy|trusted|legit|legitimate|secure|sketchy|shady|risky|ok(?:ay)?\s+to\s+use|fine\s+to\s+use)\b/i;
+  // The dashboard's suggestion "Who is Google and should I worry?" (dashboard/ask-c.js). Gemma said Google is "involved in
+  // advertising and data brokering [Tracker Radar]" (G14, Oct 25); it's answered from the records now, with who the company is.
+  const WHO_WORRY = /^\s*who\s+(?:is|are)\s+[^?]+?,?\s+(?:and\s+)?should\s+i\s+(?:worry|be\s+worried)\b/i;
+  const placeName = (c) => { const n = countryName(c); return /^(?:United |Netherlands$|Philippines$)/.test(n) ? "the " + n : n; };
+  function hibpUpdated(lists) {
+    const at = String(lists.hibp.fetchedAt || "").slice(0, 10).split("-");
+    return at.length === 3 ? ` (updated ${MONTHS[+at[1] - 1]} ${+at[2]}, ${at[0]})` : "";
+  }
+  function breachLine(subject, b, lists) {
+    if (b) return `${breachHead(subject, b)} [HIBP]: ` + breachList(b).map((x) => `${x.when}, ${x.title}: ${x.count}${x.kinds ? `; exposed ${x.kinds}` : ""}`).join(". ") + ".";
+    if (!(lists && lists.hibp)) return "";
+    return `Have I Been Pwned's list${hibpUpdated(lists)} has no breach on record for ${subject} [HIBP]. That doesn't prove it was never breached.`;
+  }
+  const BAD_CATS = new Set(["Malware", "High-risk"]);
+  const stepList = (steps) => "\n\nWhat you can do:\n" + steps.slice(0, 3).map((x) => `- ${x.charAt(0).toUpperCase()}${x.slice(1)}.`).join("\n");
+  function safeAnswer(q, sites, lists, atlas, extra) {
+    const who = WHO_WORRY.test(q);
+    if (!SAFE_Q.test(q) && !who) return null;
+    const domain = (q.toLowerCase().match(/[a-z0-9-]+(?:\.[a-z0-9-]+)+/) || [])[0];
+    const visited = namedSites(sites, q)[0] || (domain && sites.find((s) => s.domain === domain.replace(/^www\./, "")));
+    const steps = [];
+    if (visited) {
+      const s = visited, r = scoreParts(s);
+      if (!r) return null;
+      const lines = [`${s.domain} got ${article(r.grade)} ${r.grade} from Aegis One: an exposure score of ${r.score} out of 100, where higher means more of your data is exposed (${GRADE_RANGES}). [Seen on your visit]`];
+      lines.push(r.counted.length ? "What added points:\n" + r.counted.slice(0, 3).map((p) => `- ${p.label} (+${p.points}) [${PART_TAG[p.kind] || PART_TAG.observed}]`).join("\n")
+        : "Nothing added points: no trackers or tracking cookies were counted, and no data breach or foreign-adversary link is on record. [Seen on your visit]");
+      const alias = COMPANY_ALIASES[siteName(s.domain)];
+      if (alias && ALIAS_LABEL[siteName(s.domain)] && !SAME_COMPANY.has(siteName(s.domain))) {
+        const on = sites.filter((x) => (x.trackers || []).some((t) => t && t.company === alias)).length;
+        lines.push(`${ALIAS_LABEL[siteName(s.domain)]} is owned by ${alias}${on ? `, whose trackers were on ${on} of your ${sites.length} sites this week [Seen on your visit]` : ""}.`);
+      }
+      const flags = [];
+      if (s.owner && ADVERSARY.has(s.owner.country)) flags.push({ name: s.owner.company, text: `the site belongs to ${s.owner.company} (${countryName(s.owner.country)}${s.owner.stateMedia ? ", state-run media" : ""})` });
+      for (const t of s.trackers || []) {
+        if (!t || !t.company) continue;
+        const listed = t.listed || listedCompany(t.company, extra);
+        if ((ADVERSARY.has(t.country) || listed) && !flags.some((f) => f.name === t.company)) flags.push({ name: t.company, listed: !!listed, text: `${t.company} (${[ADVERSARY.has(t.country) ? countryName(t.country) : null, listed ? "Section 1260H list" : null].filter(Boolean).join("; ")})` });
+      }
+      // The "+15" line above may already name them ("Is wired.com safe?" named ByteDance and Baidu twice): only what it left out.
+      const D = (typeof window !== "undefined" ? window : self).AegisData;
+      const shownText = r.counted.slice(0, 3).filter((p) => D && D.RULES && p.rule === D.RULES.flag).map((p) => p.label).join(" ");
+      const fresh = flags.filter((f) => !shownText.includes(f.name) || (f.listed && !/1260H/.test(shownText)));
+      if (fresh.length) lines.push(`${shownText ? "Also linked here" : "Foreign-adversary links seen here"} [Seen on your visit] [Government list]: ${fresh.slice(0, 4).map((f) => f.text).join(", ")}.`);
+      const bad = [...new Set((s.trackers || []).filter((t) => t && BAD_CATS.has(t.category)).map((t) => `${t.company}${t.domain && t.domain !== String(t.company).toLowerCase() ? ` (${t.domain})` : ""}: Tracker Radar labels it as ${t.category === "Malware" ? "malware" : "high-risk"}`))];
+      if (bad.length) lines.push(`${bad.join("; ")} [Tracker Radar] [Seen on your visit].`);
+      const b = lists && lists.hibp && lists.hibp.byDomain ? lists.hibp.byDomain[s.domain] || s.breach : s.breach;
+      const bl = breachLine(s.domain, b, lists);
+      if (bl) lines.push(bl);
+      lines.push(bad.length ? "Aegis One grades how much of your data a site exposes; it doesn't check the site itself for malware or scams, but Tracker Radar's label above is worth taking seriously."
+        : "Aegis One grades how much of your data a site exposes; it doesn't check the site for malware or scams.");
+      if (b) steps.push(`if you have a ${s.domain} account, change its password and turn on two-step sign-in`);
+      if (bad.length || flags.length || r.grade === "F") steps.push("avoid entering personal details (name, email, phone, payment) there");
+      // Aegis can only decline on a banner with a reject option: after "Accept all" the banner comes back once the site's data is
+      // cleared; with no banner or no reject option, clearing after each visit is what's left (overnight backtest 2026-10-25).
+      if ((s.trackers || []).length) {
+        if (s.cookieChoice === "accepted") steps.push(`click "Clear ${s.domain}'s data" in Aegis One's pop-up, so the site's cookie banner asks again and you (or Aegis) can say no`);
+        else if (s.cookieChoice !== "declined") steps.push(`click "Clear ${s.domain}'s data" in Aegis One's pop-up after your visit, so the site can't link your next visit to this one`);
+      }
+      if ((s.trackers || []).some((t) => t && t.category === "Advertising")) steps.push("block third-party cookies in Chrome (Settings > Privacy and security > Third-party cookies)");
+      if (!steps.length) steps.push("use a different password for each site and turn on two-step sign-in");
+      return { text: lines.join("\n") + stepList(steps), sources: b || (lists && lists.hibp) ? ["site", "breach"] : ["site"] };
+    }
+    if (domain) return null;   // a site Aegis One hasn't seen: the grade answer says so; Gemma handles the rest
+    const company = namedCompanies(q, atlas)[0];
+    if (!company) return null;
+    const label = companyLabel(q, company);
+    const on = sites.filter((x) => (x.trackers || []).some((t) => t && t.company === company));
+    const x = atlas && atlas.domains ? companiesOf(atlas)[company] : null;
+    // "mostly ..." is what its trackers on your sites were for: Google's whole Tracker Radar list is mostly unlabelled
+    // (83 of 96 domains), but the Google trackers Aegis One saw were advertising (overnight check, Oct 25).
+    const seenCats = {};
+    for (const s of on) for (const t of s.trackers || []) if (t && t.company === company && t.category) seenCats[t.category] = (seenCats[t.category] || 0) + 1;
+    const top = Object.entries(seenCats).sort((a, b) => b[1] - a[1])[0];
+    const cat = top ? top[0] : null;
+    const lines = [];
+    if (who && x) {
+      const runs = `runs ${x.n} tracker domain${x.n > 1 ? "s" : ""}, the biggest on about ${x.prev}% of popular websites${x.ctry ? `; based in ${placeName(x.ctry)}` : ""} [Tracker Radar].`;
+      lines.push(/\(owned by /.test(label) ? `${shortLabel(label)} is owned by ${company}, which ${runs}` : `${label} ${runs}`);
+    }
+    const seenAs = who && x ? shortLabel(label) : label;
+    lines.push(on.length ? `Aegis One saw trackers from ${seenAs} on ${on.length} of your ${sites.length} sites this week${cat ? `, mostly ${PURPOSE[cat] ? PURPOSE[cat].toLowerCase() : cat.toLowerCase()}` : ""} [Seen on your visit] [Tracker Radar].`
+      : `Aegis One hasn't seen trackers from ${seenAs} on your sites this week [Seen on your visit].`);
+    if (who && on.length) lines.push(`On those sites, its trackers could see your IP address (your rough location), the page you were on and your device details, and recognize you from one site to the next; it doesn't prove your data was sold.`);
+    const LL = (typeof window !== "undefined" ? window : self).AegisLists;
+    const broker = LL && x ? LL.brokerFor(company, x.top, lists, atlas.entities && atlas.entities[company]) : null;
+    if (broker) lines.push(`${shortLabel(label)} is registered as a data broker in California (as "${broker.name}") [CA Broker Registry].`);
+    const listed = listedCompany(company, extra);
+    if (listed || (x && ADVERSARY.has(x.ctry))) lines.push(`${shortLabel(label)}${x && ADVERSARY.has(x.ctry) ? ` is based in ${countryName(x.ctry)}, a country on the U.S. foreign-adversary list` : ""}${listed ? listedText(listed) : " [Government list]"}.`);
+    const hits = breachSites(shortLabel(label), lists).concat(shortLabel(label) !== company ? breachSites(company, lists) : []);
+    const bl = hits.length ? breachLine(hits[0][0], hits[0][1], lists) : breachLine(shortLabel(label), null, lists);
+    if (bl) lines.push(bl);
+    lines.push(`Aegis One measures what ${shortLabel(label)}'s trackers can see on the sites you visit; it doesn't check companies for malware or scams.`);
+    steps.push("let Aegis decline the extra cookies on sites whose cookie banner has a reject option");
+    steps.push("block third-party cookies in Chrome (Settings > Privacy and security > Third-party cookies)");
+    if (hits.length) steps.push(`if you have a ${shortLabel(label)} account, change its password and turn on two-step sign-in`);
+    return { text: lines.join("\n") + stepList(steps), sources: ["site", ...(bl ? ["breach"] : []), ...(broker ? ["broker"] : [])] };
+  }
+
+  // ---------- "Does wired.com sell my data?" ----------
+  // Answered from the site's own policy record (background/policy-reader.js): its quoted sentence when Aegis One read one, a
+  // plain "I don't know yet" when it didn't. Gemma said wired.com's policy says it sells data when Aegis One had never read it
+  // (G14, Oct 25). What was seen on the visit is added, without claiming a tracker proves a sale (docs/SPEC.md Honesty rules).
+  const SELL_Q = /\b(?:sell|sells|selling|sold|share|shares|sharing)\b[^?.!]*\b(?:data|info\w*|details|me)\b/i;
+  const SAYS = {
+    sells: { yes: "sells personal information", no: "doesn't sell personal information", verb: "sells" },
+    shares: { yes: "shares personal information with partners for advertising", no: "doesn't share personal information for advertising", verb: "shares" }
+  };
+  function readOn(iso) { const [y, m, d] = String(iso || "").slice(0, 10).split("-"); return d ? `${MONTHS[+m - 1]} ${+d}, ${y}` : ""; }
+  // "Why isn't the privacy policy checked yet" after "Why did anthropic.com get a C?" got Gemma's "You have not yet checked
+  // the privacy policy for mail.yahoo.com" (Max, real Gemma on the Mac, 2026-10-25): the wrong site, and it blamed the
+  // person. Answered by code now, about the site named or the last one asked about, from background/policy-reader.js.
+  const NOT = String.raw`(?:\bnot\b|\bnever\b|\b(?:is|has|was|are|were|do|does|did|have|had|can|could|wo)n'?t\b)`;
+  const POLICY_WHY_Q = new RegExp(String.raw`\bpolic(?:y|ies)\b[^?]*(?:${NOT}|\byet\b)|${NOT}[^?]*\bpolic(?:y|ies)\b|\bwhy\b[^?]*\bpolic(?:y|ies)\b[^?]*\b(?:unread|unchecked|unknown|missing|pending)\b`, "i");
+  const POLICY_ACT_Q = /\b(?:check(?:ed)?|read|look(?:ed)?\s+at|scan(?:ned)?)\b/i;
+  const POLICY_HOW = "Aegis One reads a site's privacy policy by itself, on this computer: when a page you open on that site links to its privacy policy, " +
+    "Aegis One fetches that page from the same site (without your cookies) and Gemma checks it against 8 questions, such as whether it sells or shares your data. " +
+    "It does this at most once a week per site.";
+  const POLICY_REASONS = "It usually hasn't happened yet because:\n" +
+    "- none of the pages you opened there linked to a privacy policy on the same site (a link to another site, or a PDF, is skipped);\n" +
+    "- Aegis's AI wasn't ready when you visited (still downloading, or switched off), so Aegis One tries again on your next visit;\n" +
+    "- \"Read privacy policies with Gemma\" is turned off in Settings.";
+  function couldGo(s) {
+    const D = (typeof window !== "undefined" ? window : self).AegisData;
+    if (!D || !s.range || !(s.range.max > s.score)) return "";
+    const g = D.gradeFor(s.range.max);
+    return ` Until then, ${s.domain}'s grade shows how high it could go: as high as ${s.range.max} out of 100 (${article(g)} ${g}), instead of counting the unknown as safe.`;
+  }
+  function policyWhyAnswer(q, sites, history) {
+    if (!POLICY_WHY_Q.test(q) || !POLICY_ACT_Q.test(q)) return null;
+    let s = namedSites(sites, q)[0];
+    if (!s) for (const t of recent(history).slice().reverse()) { s = namedSites(sites, t.question)[0]; if (s) break; }
+    if (!s) return `${POLICY_HOW}\n\nUntil a site's policy is read, its grade shows how high the score could go instead of counting the unknown as safe.`;
+    const p = s.policy || {};
+    const d = s.domain;
+    if (p.checkedAt && typeof p.sells !== "boolean" && typeof p.shares !== "boolean") {
+      return `Aegis One read ${d}'s privacy policy on ${readOn(p.checkedAt)}, but it doesn't say clearly whether it sells or shares your personal information [Privacy policy]. ` +
+        "So that line stays unknown, and the grade shows how high the score could go instead of counting it as safe." + couldGo(s);
+    }
+    // Read and answered (G14, Oct 25: after "Does nytimes share my data?" this went to Gemma, which said it wasn't checked).
+    if (p.checkedAt || typeof p.sells === "boolean" || typeof p.shares === "boolean") {
+      const says = ["sells", "shares"].filter((f) => typeof p[f] === "boolean").map((f) => (p[f] ? SAYS[f].yes : SAYS[f].no));
+      const r = scoreParts(s);
+      return `Aegis One already read ${d}'s privacy policy${p.checkedAt ? ` on ${readOn(p.checkedAt)}` : ""}: it says it ${and(says)} [Privacy policy]. ` +
+        `That answer is already counted in ${d}'s grade.${r && r.unknowns && r.unknowns.length ? ` ${checkedLine(r)}` : ""}`;
+    }
+    return `Aegis One hasn't read ${d}'s privacy policy yet. ${POLICY_HOW}\n\n${POLICY_REASONS}\n\n` +
+      `What you can do: open ${d} again and let the page finish loading; the grade updates by itself once the policy is read.${couldGo(s)}`;
+  }
+
+  function sellAnswer(q, sites) {
+    if (!SELL_Q.test(q)) return null;
+    const named = namedSites(sites, q);
+    const domain = (q.toLowerCase().match(/\b[a-z0-9-]+(?:\.[a-z0-9-]+)*\.[a-z]{2,}\b/) || [])[0];
+    if (!named.length) return domain ? `I don't know: Aegis One hasn't seen ${domain.replace(/^www\./, "")} on your visits in the last 7 days, so it hasn't read its privacy policy. When you open it, Aegis One reads the policy the page links to, on this computer, and I can tell you what it says.` : null;
+    if (named.length > 1) return null;
+    const s = named[0], p = s.policy || {}, d = s.domain;
+    const quote = (f) => (p.quotes && p.quotes[f] ? `: "${String(p.quotes[f]).slice(0, 300)}"` : "");
+    const known = (f) => p[f] === true || p[f] === false;
+    const [main, other] = /\bshar/i.test(q) && !/\b(?:sell\w*|sold)\b/i.test(q) ? ["shares", "sells"] : ["sells", "shares"];
+    const lines = [];
+    if (known(main)) lines.push(`${p[main] ? "Yes, by its own words. " : ""}${d}'s privacy policy says it ${p[main] ? SAYS[main].yes : SAYS[main].no}${quote(main)} [Privacy policy]`);
+    else if (p.checkedAt || known(other)) lines.push(`${d}'s privacy policy${p.checkedAt ? ` (read on ${readOn(p.checkedAt)})` : ""} doesn't say clearly whether it ${known(other) ? SAYS[main].verb : "sells or shares"} your personal information [Privacy policy].`);
+    else lines.push(`I don't know yet: Aegis One hasn't read ${d}'s privacy policy. It reads a site's policy on this computer when a page you visit links to it, at most once a week.`);
+    if (known(other)) lines.push(`${!p[other] ? "It says it " : p[main] === true ? "It also says it " : p[main] === false ? "But it says it " : "It says it "}${p[other] ? SAYS[other].yes : SAYS[other].no}${quote(other)} [Privacy policy]`);
+    if (p.optOut === true && (p.sells || p.shares)) lines.push(`It explains how to opt out${quote("optOut")} [Privacy policy]`);
+    const r = scoreParts(s);
+    if (!known("sells") && !known("shares") && r && r.unknowns && r.unknowns.length) lines.push(checkedLine(r));
+    // What the visit showed: advertising companies, and those registered as data brokers in California.
+    const names = (xs) => { const u = [...new Set(xs)]; return and(u.length > 4 ? u.slice(0, 3).concat(`${u.length - 3} more`) : u); };
+    const ads = (s.trackers || []).filter((t) => t && t.company && t.category === "Advertising").map((t) => t.company);
+    const brokers = (s.trackers || []).filter((t) => t && t.broker).map((t) => t.broker);
+    const nAds = new Set(ads).size, nBrokers = new Set(brokers).size;
+    if (nAds || nBrokers) {
+      lines.push(`On your visit, ${d} loaded ${nAds ? `${nAds} advertising ${nAds === 1 ? "company" : "companies"} (${names(ads)}) [Seen on your visit] [Tracker Radar]` : "no advertising companies [Seen on your visit]"}` +
+        (nBrokers ? `${nAds ? ", and" : " but"} ${nBrokers} registered California data ${nBrokers === 1 ? "broker" : "brokers"} (${names(brokers)}) [CA Broker Registry]` : "") +
+        ". A tracker loading means that company could collect data about your visit; it doesn't prove your data was sold.");
+    }
+    return lines.join("\n");
+  }
+
+  // ---------- What the trackers were for: the same groups and counts as the dashboard (PLAN R19k) ----------
+  // Ask Aegis said "no record" of a malware tracker the dashboard showed: a tracker only reached Gemma from its 4 detailed sites
+  // or the top-10 companies. Every purpose is listed now; malware, high-risk and screen recording are never cut.
+  const PURPOSE = {
+    "Advertising": "Advertising", "Analytics": "Measuring your visits", "Session recording": "Recording your screen",
+    "Social": "Social media", "Data broker": "Data brokers", "Tracking": "Unlabelled tracking",
+    "Malware": "Labelled malware", "High-risk": "High-risk behavior", "Obscure ownership": "Hidden owner"
+  };
+  const NEVER_CUT = new Set(["Labelled malware", "High-risk behavior", "Recording your screen"]);
+  // The dashboard's way: each tracker address once, its first category ("Data broker" when its company is registered).
+  function trackerPurposes(sites) {
+    const domainCat = new Map();
+    for (const s of sites) for (const t of s.trackers || []) if (t && !domainCat.has(t.domain)) domainCat.set(t.domain, t.broker ? "Data broker" : t.category);
+    return domainCat;
+  }
+  function purposeLines(sites) {
+    const domainCat = trackerPurposes(sites);
+    const groups = new Map();                    // label -> { n, companies: Map(company -> Set(site)) }
+    for (const cat of domainCat.values()) { const label = PURPOSE[cat] || cat || "Other"; if (!groups.has(label)) groups.set(label, { n: 0, companies: new Map() }); groups.get(label).n++; }
+    for (const s of sites) for (const t of s.trackers || []) {
+      if (!t || !t.company) continue;
+      const g = groups.get(PURPOSE[domainCat.get(t.domain)] || domainCat.get(t.domain) || "Other");
+      if (!g) continue;
+      if (!g.companies.has(t.company)) g.companies.set(t.company, new Set());
+      g.companies.get(t.company).add(s.domain);
+    }
+    if (!groups.size) return "";
+    const rows = [...groups].sort((a, b) => b[1].n - a[1].n || a[0].localeCompare(b[0])).map(([label, g]) => {
+      const all = NEVER_CUT.has(label);
+      const cos = [...g.companies].sort((a, b) => b[1].size - a[1].size || a[0].localeCompare(b[0]));
+      const shown = all ? cos : cos.slice(0, 6);
+      const txt = shown.map(([co, set]) => { const l = [...set]; return set.size === 1 ? `${co} on ${l[0]}` : `${co} on ${set.size} sites (${l.slice(0, all ? 8 : 3).join(", ")}${set.size > (all ? 8 : 3) ? "..." : ""})`; });
+      return `- ${label} ${g.n}: ${txt.join("; ")}${cos.length > shown.length ? `; and ${cos.length - shown.length} more compan${cos.length - shown.length === 1 ? "y" : "ies"}` : ""}`;
+    });
+    return `What the trackers were for (tracker addresses, same as the dashboard) [Seen on your visit] [Tracker Radar]:\n${rows.join("\n")}`;
+  }
+
+  // ---------- Where each dashboard item came from (PLAN R19l) ----------
+  // "What websites were using the screen recording tracker cookies?" (Preston, real Gemma, Oct 25): Aegis couldn't say which
+  // site the dashboard's screen recorder or malware tracker came from. The purpose lines were in its evidence (R19k), but a
+  // small model loses one line among ~13,000 characters. A question asking where one of these came from is answered from
+  // the records, like grades and breaches: every match, counted the dashboard's way, and how many sites had none.
+  const PURPOSE_ASKED = [   // [Tracker Radar category, the words people use for it]
+    ["Session recording", /\b(?:screen|session)[\s-]*(?:record\w*|replay\w*)|\brecord\w*\s+(?:my|your|the|what\s+(?:i|you))\b[^?.!]{0,20}\bscreens?\b|\brecord(?:s|ed|ing)?\s+(?:me|us)\b/i],
+    ["Malware", /\bmal-?ware\b|\bmalicious\b/i],
+    ["High-risk", /\bhigh[\s-]*risk\b/i],
+    ["Obscure ownership", /\bhidden\s+owner\w*|\bobscure\s+owner\w*/i],
+    ["Tracking", /\bunlabell?ed\b/i],
+    ["Data broker", /\bdata[\s-]*brokers?\b/i],
+    ["Advertising", /\badvertis\w*|\bad[\s-]*trackers?\b/i],
+    ["Analytics", /\banalytics\b|\bmeasur\w*\s+(?:my|your)\s+visits\b/i],
+    ["Social", /\bsocial[\s-]*media\b/i]
+  ];
+  // Words people only use when they mean that dashboard item: any question about them is answered from the records.
+  const RARE_PURPOSES = new Set(["Session recording", "Malware", "High-risk", "Obscure ownership", "Tracking"]);
+  const WHERE_Q = /\b(?:which|what)\s+(?:of\s+(?:my|the|your)\s+)?(?:[a-z-]+\s+){0,3}?(?:web\s*)?(?:sites?|pages?|compan(?:y|ies)|trackers?|ones?|domains?|addresses|brokers?|recorders?)\b|\bwhere\b|\bwho\b|\b(?:came|come|comes|coming)\s+from\b|\boriginat\w*|\b(?:list|show|name)\b|\bany\s+(?:of\s+)?(?:my\s+|the\s+|these\s+)?(?:[a-z-]+\s+){0,2}?(?:web\s*)?(?:sites?|pages?|trackers?|compan(?:y|ies)|brokers?|recorders?)\b|\b(?:was|were|is|are)\s+there\b|\bhow\s+many\b/i;
+  const DEFINE_Q = /^\s*(?:(?:and\s+)?(?:what|how)\s+about\b|what\s+(?:is|are|was|were|does|do)\b|what'?s\b|explain\b|describe\b|define\b|tell\s+me\s+(?:about|more)\b)/i;
+  const EXISTS_Q = /^\s*(?:did|does|do|was|were|is|are|has|have|had)\b/i;
+  // "Can malware steal my passwords?" (G14: Gemma named neither the tracker nor its site). "Can you...?" and "Can Aegis One...?"
+  // are about what Aegis One does, and stay with Gemma.
+  const CAN_Q = /^\s*(?:can|could)\s+(?!(?:you|aegis|it|i|we)\b)/i;
+  const PLAIN_CAT = { "Session recording": "session recording", "Analytics": "analytics" };
+  const CAT_WORDS = { "Session recording": "session recording", "Malware": "malware", "High-risk": "high-risk", "Obscure ownership": "having a hidden owner",
+    "Tracking": "unlabelled tracking", "Advertising": "advertising", "Analytics": "analytics", "Social": "social media" };
+  const MEANING = {
+    "Session recording": "Session-recording scripts can capture what you do on a page (clicks, scrolling, mouse movement and what you type into forms) so the site can replay your visit.",
+    "Malware": "DuckDuckGo's Tracker Radar gives the malware label to addresses linked to harmful software. A script loaded from one can read what you type on that page, passwords included, but Aegis One can't see what it did on your visit.",
+    "High-risk": "Tracker Radar gives the label \"unknown high-risk behavior\" to addresses that acted in risky ways it couldn't explain.",
+    "Obscure ownership": "Tracker Radar uses this label when it can't find out who owns a tracker.",
+    "Tracking": "Tracker Radar lists some addresses as trackers without labelling what they're for.",
+    "Data broker": "These companies are registered in California's Data Broker Registry, which lists businesses that collect and sell or share data about people they don't have a direct relationship with.",
+    "Advertising": "Ad companies can recognize you from site to site, build a profile of your interests and target ads at you.",
+    "Analytics": "These measure how you use a site (pages, clicks, time spent), for the site and sometimes for the measuring company too.",
+    "Social": "Social networks' code (share buttons, pixels) can tell them you visited, even if you never click it."
+  };
+  const PURPOSE_STEPS = {
+    "Session recording": ["use a tracker-blocking browser extension: it stops most session recorders", "avoid typing personal details (name, email, phone, payment) on those sites"],
+    "Malware": ["avoid entering personal details (name, email, phone, payment) on those sites", "use a tracker-blocking browser extension"],
+    "other": ["let Aegis decline the extra cookies on sites whose cookie banner has a reject option", "block third-party cookies in Chrome (Settings > Privacy and security > Third-party cookies)", "use a tracker-blocking browser extension"]
+  };
+  PURPOSE_STEPS["High-risk"] = PURPOSE_STEPS.Malware;
+  const NOT_PROOF = "A tracker loading means the company could collect this; it doesn't prove it did, or that your data was sold.";
+  const LABEL_CAT = Object.fromEntries(Object.entries(PURPOSE).map(([cat, label]) => [label.toLowerCase(), cat]));
+
+  // The purposes a question asks about: the dashboard's own label in quotes ("recording your screen"), or everyday words.
+  function askedPurposes(q) {
+    const quoted = [...String(q).matchAll(/"([^"]+)"/g)].map((m) => LABEL_CAT[m[1].toLowerCase()]).filter(Boolean);
+    if (quoted.length) return { cats: [...new Set(quoted)], label: true };
+    return { cats: PURPOSE_ASKED.filter(([, re]) => re.test(q)).map(([cat]) => cat), label: false };
+  }
+  // One row per company: its tracker addresses in this group and the sites they loaded on.
+  function companyRows(sites, keep) {
+    const rows = new Map();
+    for (const s of sites) for (const t of s.trackers || []) {
+      if (!t || !keep(t)) continue;
+      const k = t.company || t.domain;
+      let r = rows.get(k);
+      if (!r) rows.set(k, (r = { company: k, domains: [], sites: [], country: t.country, broker: t.broker || null }));
+      if (!r.domains.includes(t.domain)) r.domains.push(t.domain);
+      if (!r.sites.includes(s.domain)) r.sites.push(s.domain);
+    }
+    return [...rows.values()].sort((a, b) => b.sites.length - a.sites.length || a.company.localeCompare(b.company));
+  }
+  // "Yandex (yandex.ru, based in Russia) on tass.com"; a company named after its address isn't written twice.
+  function rowText(r, maxSites) {
+    const addr = r.domains.filter((d) => d !== String(r.company).toLowerCase());
+    const bits = [addr.length > 3 ? `${addr.slice(0, 3).join(", ")} and ${addr.length - 3} more` : addr.join(", "), ADVERSARY.has(r.country) ? `based in ${countryName(r.country)}` : ""].filter(Boolean);
+    const on = r.sites.length > maxSites ? `${r.sites.length} sites: ${r.sites.slice(0, maxSites).join(", ")} and ${r.sites.length - maxSites} more` : and(r.sites);
+    return `${r.company}${bits.length ? ` (${bits.join(", ")})` : ""}${r.broker ? `, registered as "${r.broker}",` : ""} on ${on}`;
+  }
+  const ROWS_SHOWN = 12;
+  function rowLines(rows) {
+    return rows.slice(0, ROWS_SHOWN).map((r) => `- ${rowText(r, 6)}`).join("\n") + (rows.length > ROWS_SHOWN ? `\n- and ${rows.length - ROWS_SHOWN} more companies` : "");
+  }
+  const sitesWord = (n) => `${n} site${n === 1 ? "" : "s"}`;
+  // "None of your other 6 sites loaded one."
+  const othersLine = (others) => (others > 0 ? `\nNone of your other ${sitesWord(others)} loaded one.` : "");
+
+  // Cookies the listed companies left on those sites (names only), for questions that say "cookies".
+  function cookieLine(rows, sites) {
+    const cos = new Map(rows.map((r) => [String(r.company).toLowerCase(), r]));
+    const found = [];
+    for (const s of sites) {
+      const by = new Map();
+      for (const c of s.cookies || []) {
+        const r = c && c.company && cos.get(String(c.company).toLowerCase());
+        if (r && r.sites.includes(s.domain)) { if (!by.has(r.company)) by.set(r.company, []); if (!by.get(r.company).includes(c.name)) by.get(r.company).push(c.name); }
+      }
+      for (const [co, names] of by) found.push(`${and(names.slice(0, 4))}${names.length > 4 ? ` and ${names.length - 4} more` : ""} (${co}) on ${s.domain}`);
+    }
+    return found.length ? `\nCookies from these companies on those sites [Cookie Database]: ${found.slice(0, 6).join("; ")}.` : "";
+  }
+
+  // A registered data broker counts under "Data brokers" on the dashboard whatever Tracker Radar labels it (trackerPurposes).
+  // Its trackers with this label are named after the list, so none is left out (G14: Bombora's session recorder, ml314.com).
+  const brokerAlso = (domainCat, cat) => (t) => cat !== "Data broker" && domainCat.get(t.domain) === "Data broker" && t.category === cat;
+  function alsoText(also, words, first) {
+    const what = also.length > 1 ? "these companies' trackers" : also[0].domains.length > 1 ? "this company's trackers" : "this company's tracker";
+    return `Tracker Radar ${first ? "" : "also "}labels ${what} as ${words}; the dashboard counts ${what.endsWith("tracker") ? "it" : "them"} under "Data brokers" ` +
+      `[Seen on your visit] [Tracker Radar] [CA Broker Registry]:\n${rowLines(also)}`;
+  }
+
+  // { text, found }: found is false when no site in the question (or none this week) had one.
+  function purposeSection(cat, sites, domainCat, scope, company, wantsCookies, brokersKnown) {
+    const label = PURPOSE[cat] || cat;
+    const tag = cat === "Data broker" ? "[Seen on your visit] [CA Broker Registry]" : "[Seen on your visit] [Tracker Radar]";
+    if (cat === "Data broker" && !brokersKnown) return { text: "Aegis One hasn't downloaded California's Data Broker Registry yet (it downloads it once a day when Chrome starts), so I can't tell which trackers belong to registered data brokers.", found: false };
+    const words = CAT_WORDS[cat] || cat.toLowerCase();
+    const kind = cat === "Data broker" ? "tracker from a company registered in California's Data Broker Registry" : `tracker that Tracker Radar labels as ${words}${words.includes(label.toLowerCase()) ? "" : ` ("${label.toLowerCase()}")`}`;
+    const from = company ? ` from ${company}` : "";
+    const title = `${label}${PLAIN_CAT[cat] ? ` (${PLAIN_CAT[cat]})` : ""}${from}`;
+    let rows = companyRows(scope || sites, (t) => domainCat.get(t.domain) === cat);
+    let also = companyRows(scope || sites, brokerAlso(domainCat, cat));
+    if (company) { rows = rows.filter((r) => r.company === company); also = also.filter((r) => r.company === company); }   // "Where did Hotjar record my screen?"
+    const all = [...rows, ...also];
+    const cookies = (where) => (wantsCookies && all.length ? cookieLine(all, where) : "");
+    if (scope) {   // the sites the question named, each with its answer
+      const none = scope.filter((s) => !all.some((r) => r.sites.includes(s.domain)));
+      const lines = none.map((s) => `${s.domain} loaded no ${kind} ${tag}.`);
+      if (rows.length) lines.push(`${title} on ${and(scope.filter((s) => rows.some((r) => r.sites.includes(s.domain))).map((s) => s.domain))} ${tag}:\n${rowLines(rows)}`);
+      if (also.length) lines.push(alsoText(also, words, !rows.length));
+      return { text: lines.join("\n") + cookies(scope), found: all.length > 0 };
+    }
+    if (!all.length) return { text: `None of your ${sitesWord(sites.length)} this week loaded a ${kind} ${tag}.`, found: false };
+    const on = new Set(all.flatMap((r) => r.sites)).size;
+    const others = sites.length - on > 0 ? `\nNone of your other ${sitesWord(sites.length - on)} loaded one${from}.` : "";
+    if (!rows.length) return { text: alsoText(also, words, true) + others + cookies(sites), found: true };
+    const n = new Set(rows.flatMap((r) => r.domains)).size;
+    const shown = new Set(rows.flatMap((r) => r.sites)).size;
+    return { text: `${title}: ${n} tracker address${n === 1 ? "" : "es"} on ${shown} of your ${sitesWord(sites.length)} this week ${tag}:\n${rowLines(rows)}` +
+      `${also.length ? `\n${alsoText(also, words, false)}` : ""}${others}` + cookies(sites), found: true };
+  }
+
+  // Device fingerprinting: the dashboard's companies (a script Tracker Radar rates 2 or more), with where they loaded.
+  const FINGERPRINT_Q = /\bfinger-?print\w*/i;
+  const FP_MEANING = "Tracker Radar rates these companies' scripts as likely to read device details (screen, fonts, graphics chip and more) that can recognize your browser without cookies. Clearing cookies doesn't stop it.";
+  function fingerprintRows(sites) { return companyRows(sites, (t) => (t.fingerprinting || 0) >= 2); }
+  function fingerprintSection(sites, scope) {
+    const tag = "[Seen on your visit] [Tracker Radar]";
+    const rows = fingerprintRows(scope || sites);
+    if (scope) {
+      const none = scope.filter((s) => !rows.some((r) => r.sites.includes(s.domain)));
+      return { text: [...none.map((s) => `${s.domain} loaded no tracker that Tracker Radar rates as likely to fingerprint your device ${tag}.`),
+        ...(rows.length ? [`Device fingerprinting on ${and(scope.filter((s) => !none.includes(s)).map((s) => s.domain))} ${tag}:\n${rowLines(rows)}`] : [])].join("\n"), found: rows.length > 0 };
+    }
+    if (!rows.length) return { text: `None of your ${sitesWord(sites.length)} this week loaded a tracker that Tracker Radar rates as likely to fingerprint your device ${tag}.`, found: false };
+    const on = new Set(rows.flatMap((r) => r.sites)).size;
+    return { text: `Device fingerprinting: ${rows.length} ${rows.length === 1 ? "company" : "companies"} on ${on} of your ${sitesWord(sites.length)} this week ${tag}:\n${rowLines(rows)}${othersLine(sites.length - on)}`, found: true };
+  }
+
+  // Which dashboard item, if any, the question asks to be shown or explained from the records.
+  function dashboardAnswer(q, sites, lists, data) {
+    if (!sites.length || SELL_Q.test(q) || BREACH_Q.test(q)) return null;
+    const named = namedSites(sites, q);
+    const asked = askedPurposes(q);
+    const where = WHERE_Q.test(q), define = DEFINE_Q.test(q), exists = EXISTS_Q.test(q), can = CAN_Q.test(q), steps = WANTS_STEPS.test(q) || can;
+    const cats = asked.cats.filter((cat) => asked.label || where || (named.length && exists) || (RARE_PURPOSES.has(cat) && (define || exists || steps)));
+    const fp = FINGERPRINT_Q.test(q) && !asked.cats.length && (where || (named.length && exists));
+    if (!cats.length && !fp) return null;
+    const scope = named.length ? named : null;
+    const brokersKnown = !!((lists && lists.brokers) || (data && data.lists && data.lists.brokersAsOf));
+    const parts = [], meanings = [], stepsFor = [];
+    if (fp) {
+      const sec = fingerprintSection(sites, scope);
+      parts.push(sec.text);
+      meanings.push(FP_MEANING);
+      if (sec.found) stepsFor.push("use a tracker-blocking browser extension: it stops many fingerprinting scripts before they run");
+    }
+    const domainCat = trackerPurposes(sites);
+    for (const cat of cats) {
+      const inGroup = [...new Set(sites.flatMap((s) => (s.trackers || []).filter((t) => t && (domainCat.get(t.domain) === cat || brokerAlso(domainCat, cat)(t))).map((t) => t.company)))];
+      const company = companiesIn(q, inGroup)[0] || null;
+      const sec = purposeSection(cat, sites, domainCat, scope, company, /\bcookies?\b/i.test(q), brokersKnown);
+      parts.push(sec.text);
+      if (cat !== "Data broker" || brokersKnown) meanings.push(MEANING[cat]);
+      if (sec.found) stepsFor.push(...(PURPOSE_STEPS[cat] || PURPOSE_STEPS.other));
+    }
+    // Advice about "those sites", and what a tracker loading does and doesn't prove, only when something was found.
+    const text = parts.join("\n\n") + (meanings.length ? `\n\n${meanings.join(" ")}${stepsFor.length ? ` ${NOT_PROOF}` : ""}` : "");
+    return text + (steps && stepsFor.length ? stepList([...new Set(stepsFor)]) : "");
+  }
+
+  // The same lists for Gemma, for other questions about these items ("How does malware get onto a website?"). A question
+  // about one company (or a follow-up about the last one) gets only that company's line: "Are they a data broker?" after
+  // "Who is Criteo?" got every broker on your sites, and Gemma answered about the first one (G14, 2026-10-25).
+  function dashboardFacts(q, sites, brokersKnown, about) {
+    const asked = askedPurposes(q).cats;
+    if (!sites.length || (!asked.length && !FINGERPRINT_Q.test(q))) return [];
+    const only = (rows) => (about && about.length ? rows.filter((r) => about.includes(r.company)) : rows);
+    const notThere = (why) => about.map((co) => {
+      const where = sites.filter((s) => (s.trackers || []).some((t) => t && t.company === co)).map((s) => s.domain);
+      return where.length ? `${co} loaded on ${where.length > 4 ? sitesWord(where.length) : and(where)}, but ${why(co)}` : `${co} didn't load on your ${sitesWord(sites.length)} this week`;
+    }).join("; ");
+    const fact = (label, rows, tag, why, also = [], words = "") => {
+      if (label === PURPOSE["Data broker"] && !brokersKnown) return [`- ${label}: Aegis One hasn't downloaded California's Data Broker Registry yet, so it can't tell which trackers belong to registered data brokers`];
+      const on = new Set([...rows, ...also].flatMap((r) => r.sites)).size;
+      const alsoLine = also.length ? [`- Also labelled ${words} by Tracker Radar, counted under "Data brokers" on the dashboard [Seen on your visit] [Tracker Radar] [CA Broker Registry]: ${also.slice(0, 8).map((r) => rowText(r, 4)).join("; ")}`] : [];
+      if (!rows.length && !also.length && about && about.length) return [`- ${label} on your sites ${tag}: ${notThere(why)}`];
+      if (!rows.length) return [`- ${label} on your sites ${tag}: none ${also.length ? "counted here on the dashboard" : `on your ${sitesWord(sites.length)}`}`, ...alsoLine];
+      return [`- ${label} on your sites ${tag}: ${rows.slice(0, 8).map((r) => rowText(r, 4)).join("; ")}${rows.length > 8 ? `; and ${rows.length - 8} more companies` : ""}` +
+        (sites.length - on > 0 ? `; none on your other ${sitesWord(sites.length - on)}` : ""), ...alsoLine];
+    };
+    const domainCat = trackerPurposes(sites);
+    const out = asked.flatMap((cat) => fact(PURPOSE[cat] || cat, only(companyRows(sites, (t) => domainCat.get(t.domain) === cat)),
+      cat === "Data broker" ? "[Seen on your visit] [CA Broker Registry]" : "[Seen on your visit] [Tracker Radar]",
+      (co) => (cat === "Data broker" ? `Aegis One didn't find ${co} in California's Data Broker Registry` : `Tracker Radar doesn't label ${co}'s trackers there as ${CAT_WORDS[cat] || cat.toLowerCase()}`),
+      only(companyRows(sites, brokerAlso(domainCat, cat))), CAT_WORDS[cat] || cat.toLowerCase()));
+    if (FINGERPRINT_Q.test(q)) out.push(...fact("Device fingerprinting", only(fingerprintRows(sites)), "[Seen on your visit] [Tracker Radar]",
+      (co) => `Tracker Radar doesn't rate ${co}'s scripts as likely to fingerprint your device`));
+    return out;
+  }
+
+  // ---------- Cite-and-check (PLAN R19i): every name Gemma uses must be in its evidence ----------
+  // A sentence naming a tracker company or a web address that Aegis's evidence doesn't contain is dropped (Gemma filled gaps
+  // from its general knowledge). The "What you can do" steps are left alone. Only names Aegis One knows can be checked.
+  function dropUnknownNames(text, context, atlas, memo) {
+    if (!atlas || !atlas.domains) return text;
+    const names = Object.keys(companiesOf(atlas));
+    const ctx = context.toLowerCase();
+    const known = (n) => ctx.includes(n.toLowerCase()) || Object.keys(COMPANY_ALIASES).some((a) => COMPANY_ALIASES[a] === n && ctx.includes(a));
+    const ok = (sentence) => {
+      if (memo && memo.has(sentence)) return memo.get(sentence);
+      const plain = sentence.replace(/\[[^\]]*\]/g, "");
+      // Whole names only ("Criteo", or a nickname like "Meta"): a first word alone ("France ...") isn't proof of a company.
+      const nq = " " + ((typeof window !== "undefined" ? window : self).AegisLists.norm(plain)) + " ";
+      const whole = (n) => nq.includes(" " + (typeof window !== "undefined" ? window : self).AegisLists.norm(n) + " ") ||
+        Object.keys(COMPANY_ALIASES).some((a) => COMPANY_ALIASES[a] === n && nq.includes(" " + a + " "));
+      const bad = companiesIn(plain, names).filter(whole).some((n) => !known(n)) ||
+        (plain.toLowerCase().match(/\b[a-z0-9-]+\.(?:com|net|org|io|co|ru|cn|de|uk|fr|tv|me|info)\b/g) || []).some((d) => !ctx.includes(d));
+      if (memo) memo.set(sentence, !bad);
+      return !bad;
+    };
+    const cut = text.search(/What you can do:/i);
+    const body = cut >= 0 ? text.slice(0, cut) : text, tail = cut >= 0 ? text.slice(cut) : "";
+    // Split after a sentence and its source tags, never between them ("... France. [Tracker Radar] Its tracker ...").
+    const kept = body.split("\n").map((par) => par.split(/(?<=[.!?](?:\s*\[[^\]]+\])*)\s+(?!\[)/).filter((x) => !x.trim() || ok(x)).join(" ")).join("\n").replace(/\n{3,}/g, "\n\n").trim();
+    if (!kept && body.trim()) return ("Aegis One has no record of that in your browsing or its lists." + (tail ? "\n\n" + tail : "")).trim();
+    return (kept + (tail ? "\n\n" + tail : "")).trim();
+  }
+
+  // ---------- About Aegis One itself (the dashboard's own suggested questions ask these) ----------
+  // Only added when the question is about Aegis One or C, so the usual context keeps its room for your sites.
+  const FEATURE_Q = /\b(aegis|extension|protect\s*me|beware|alerts?|warn\w*|unsafe|go back|continue anyway|clear\w*|forget|fully checked|partly checked|partially checked|block\w*|trust\w*|rubric|accurate|reliable|consent|confirm\w*|declin\w*|reject\w*|accept\w*|pop-?ups?)\b/i;
+  const AEGIS_FACTS = `About Aegis One itself (for questions about what Aegis One or Aegis does; no tag needed):
+- Aegis One shows which companies each site you visit connects you to, and grades the site A to F by how much of your data it exposes. It doesn't block trackers or ads: it shows them, and Aegis declines cookie tracking when you let him.
+- "Protect me": on a cookie banner that has a reject option, Aegis clicks that option for you, then checks the site's own consent record and says "Nice!" only if it confirms the optional cookies are off. A confirmed decline takes the cookie points off the site's grade. Settings has "Protect me automatically".
+- "Beware!": on a cookie banner with only an Accept button, Aegis warns that the site gives you no way to say no; that adds points to its grade.
+- Foreign-adversary alert: Aegis pops up when a page loads a tracker from a company based in a listed foreign-adversary country or on the Section 1260H list, or when the site itself belongs to one.
+- Unsafe-site warning: on a site graded F that also has such a link, or a data breach reported in the last year, Aegis warns you with "Go back" and "Continue anyway". It never blocks the site.
+- The "Clear" button in Aegis One's pop-up deletes that site's own cookies and storage in Chrome, so it can't link your next visit to earlier ones. Other companies' cookies, your history and your passwords stay.
+- "Fully checked" next to a grade means every line of the grade has an answer for that site. "Partly checked" means something isn't known yet, usually because the site's privacy policy hasn't been read, so Aegis One shows how high the score could go instead of counting the unknown as safe.
+- The grade is Aegis One's own rubric, the same for every site, and the pop-up lists every point with its source. It measures how much of your data a site exposes, not whether the site is a scam.`;
+  const featureFacts = (question) => (FEATURE_Q.test(String(question || "")) || toC(question) ? `\n\n${AEGIS_FACTS}` : "");
+
+  // What Aegis did this week, with the dashboard's "Aegis's impact" numbers and words (shared/stats.js, dashboard/activity.js).
+  const IMPACT_Q = /\b(?:aegis|you)\s+(?:do|did|done|doing|help\w*|protect\w*|stop\w*|block\w*|declin\w*|catch\w*|caught|sav\w*)\b|\bimpact\b|\bstepped in\b/i;
+  const times = (n, one, many) => `${n} ${n === 1 ? one : many}`;
+  function impactFact(stats) {
+    const S = (typeof window !== "undefined" ? window : self).AegisStats;
+    const sum = S && stats ? S.summary(stats, "week") : null;
+    if (!sum || !sum.totals.popups) return ["- Aegis hasn't shown any pop-ups in the last 7 days [Seen on your visit]."];
+    const n = (k) => sum.totals.events[k] || 0;
+    return [`- What Aegis did for you in the last 7 days (the same numbers as the dashboard's "Aegis's impact") [Seen on your visit]: Aegis stepped in ${times(sum.totals.popups, "time", "times")}: ` +
+      `${times(n("popup-cookie"), "offer", "offers")} to decline cookies, ${times(n("popup-accept-only"), "warning", "warnings")} about banners with no reject option, ` +
+      `${times(n("popup-adversary"), "foreign-adversary alert", "foreign-adversary alerts")}, ${times(n("popup-unsafe"), "unsafe-site warning", "unsafe-site warnings")}. ` +
+      `Aegis declined cookies for you ${times(n("decline-click"), "time", "times")} ("Protect me" or automatic), and the site's own consent record confirmed ${n("decline-confirmed")} of them. ` +
+      `You said no on a site yourself ${times(n("rejected-on-site"), "time", "times")} and accepted all cookies yourself ${times(n("accepted-on-site"), "time", "times")}.`];
+  }
+
+  // "How many breaches happen without people knowing?": nobody can count breaches no one has found, but Have I Been
+  // Pwned's own list shows how long the found ones took to come out (the breach date vs. the day it was added).
+  // Answered by code: with this figure in its evidence, Gemma (4 E4B, Mac, overnight Oct 25) still said "Aegis One has no record".
+  const DELAY_Q = /\b(?:without\s+(?:\w+\s+)?(?:knowing|noticing|realizing|realising|finding out)|unnoticed|undetected|unreported|never (?:find|found) out|find out|how long|take to (?:find|discover|notice|come out)|discovered|hidden|secret)\b/i;
+  function delayAnswer(q, lists) {
+    if (!BREACH_Q.test(q) || !DELAY_Q.test(q) || !(lists && lists.hibp && lists.hibp.byDomain)) return null;
+    const days = [];
+    for (const b of Object.values(lists.hibp.byDomain)) {
+      for (const x of [b, ...((b && b.earlier) || [])]) {
+        const d = x ? (Date.parse(x.addedDate) - Date.parse(x.breachDate)) / 864e5 : NaN;
+        if (d >= 0) days.push(d);
+      }
+    }
+    if (days.length < 5) return null;
+    days.sort((a, b) => a - b);
+    const mid = days[Math.floor(days.length / 2)], over = days.filter((d) => d > 365).length;
+    const span = (d) => (d < 60 ? `${Math.round(d)} days` : d < 730 ? `${Math.floor(d / 30.44)} months` : `${Math.floor(d / 365.25)} years`);
+    return `Aegis One can't count breaches nobody has found yet, but it can show how late the ones that were found came out.\n` +
+      `In Have I Been Pwned's list${hibpUpdated(lists)}, ${days.length} breaches have both dates: half were added at least ${span(mid)} after the breach happened, ` +
+      `and ${over} of the ${days.length} (${Math.round((over / days.length) * 100)}%) more than a year later [HIBP].` +
+      stepList(["use a different password for each site and turn on two-step sign-in, so a breach nobody has found yet can't open your other accounts"]);
+  }
+
+  // A registered name that cleans down to an everyday word ("The Data Group, LLC" -> "data") counts only written like a
+  // name, with its capital and not as the first word: "Are they a data broker?" got The Data Group's facts instead of the
+  // last question's Criteo (G14, 2026-10-25).
+  function writtenAsName(question, n) {
+    if (n.includes(" ") || !(BREACH_STOP.has(n) || COMMON_WORDS.has(n) || GENERIC_FIRST.has(n) || EVERYDAY_NAMES.has(n) || OWN_TOPIC.test(n))) return true;
+    return [...String(question).matchAll(new RegExp(`(^|[^A-Za-z0-9])(${escapeRe(n)})(?![A-Za-z0-9])`, "gi"))].some((m) => m.index + m[1].length > 0 && /^[A-Z]/.test(m[2]));
+  }
+
+  // Facts about companies or sites named in the question, looked up in the local lists.
+  function lookupFacts(question, lists, atlas) {
+    const L = (typeof window !== "undefined" ? window : self).AegisLists;
+    if (!L) return [];
+    const q = " " + L.norm(question) + " ";
+    const has = (name) => { const n = L.norm(name); return n.length >= 4 && q.includes(" " + n + " "); };
+    const facts = [];
+    const seen = new Set();
+
+    if (atlas && atlas.domains) {
+      const byCo = companiesOf(atlas);
+      for (const co of companiesIn(question, Object.keys(byCo))) {
+        if (facts.length >= 6) break;
+        const x = byCo[co];
+        seen.add(L.norm(co));
+        const cat = Object.entries(x.cats).sort((a, b) => b[1] - a[1])[0][0];
+        const alias = Object.keys(COMPANY_ALIASES).find((a) => COMPANY_ALIASES[a] === co && q.includes(" " + a + " "));
+        const owns = alias ? ` (Tracker Radar lists ${alias.replace(/\b\w/g, (c) => c.toUpperCase())}'s trackers under ${co}, its owner)` : "";
+        facts.push(`- ${co}${owns} runs ${x.n} tracker domain${x.n > 1 ? "s" : ""} (mostly ${cat}), the biggest on about ${x.prev}% of popular websites${x.ctry ? `; based in ${countryName(x.ctry)}` : ""} [Tracker Radar]`);
+        const b = L.brokerFor(co, x.top, lists, atlas.entities && atlas.entities[co]);
+        if (b) facts.push(`- ${co} is registered as a data broker in California (as "${b.name}") [CA Broker Registry]`);
+      }
+    }
+    for (const b of (lists && lists.brokers && lists.brokers.list) || []) {
+      if (facts.length >= 8) break;
+      const hit = [b.name, b.dba].find(n => n && has(n) && !seen.has(L.norm(n)) && writtenAsName(question, L.norm(n)));
+      if (hit) { seen.add(L.norm(hit)); facts.push(`- ${b.name} is registered as a data broker in California [CA Broker Registry]`); }
+    }
+    for (const [d, b] of breachSites(question, lists)) {
+      if (facts.length >= 10) break;
+      // Same first part as before (the newest breach), then every earlier one, so Gemma sees the whole record.
+      const older = breachList(b).filter((x) => x.title !== (b.title || b.name) || x.when !== monthYear(b.breachDate));
+      facts.push(`- ${b.title} (${d}) had a ${breachText(b)}` +
+        (older.length ? `; earlier breaches on record: ${older.map((x) => `${x.when}, ${x.title}: ${x.count}${x.kinds ? `; exposed ${x.kinds}` : ""}`).join(". ")} [HIBP]` : ""));
+    }
+    return facts;
+  }
+
+  // ---------- Speed: a short, question-focused summary instead of every site in full ----------
+  // A week of browsing written out in full was ~40,000 words: Gemma took a long time to read it (and its
+  // context cut part of it off). Now Gemma gets totals and cross-site lists covering EVERY site, full details
+  // only for the few sites that matter to the question, and one short line for the next riskiest ones.
+  const DETAIL_SITES = 4;     // full detail lines (trackers, cookies, policy, breach)
+  const SHORT_SITES = 10;     // then one short line each
+  const LIST_MAX = 15;        // entries per cross-site list (brokers, foreign-adversary links, policies)
+  const MAX_CONTEXT_CHARS = 15000;   // ~4,000 tokens: fits Ollama's 8,192 and the in-browser model with room to answer
+  const COMMON_WORDS = new Set(["the", "and", "you", "your", "who", "why", "how", "what", "was", "are", "can", "did", "does", "has",
+    "get", "got", "see", "use", "new", "web", "app", "all", "any", "not", "now", "our", "out", "way", "site", "sites", "news", "mail", "shop", "store", "home", "help"]);
+
+  function siteName(domain) {   // "news.bbc.co.uk" -> "bbc", "flightdeals.example" -> "flightdeals"
+    const p = String(domain || "").toLowerCase().split(".");
+    if (p.length < 2) return p[0] || "";
+    const sld = p.length >= 3 && p[p.length - 1].length === 2 && /^(co|com|org|net|ac|gov|edu)$/.test(p[p.length - 2]);
+    return p[p.length - (sld ? 3 : 2)] || "";
+  }
+
+  // Sites the question names ("cnn.com" also finds edition.cnn.com; "flightdeals" alone works too).
+  function namedSites(sites, question) {
+    if (!question) return [];
+    const q = String(question).toLowerCase();
+    const tokens = [...new Set((q.match(/[a-z0-9-]+(?:\.[a-z0-9-]+)*/g) || []).map(t => t.replace(/^www\./, "")))];
+    return sites.filter(s => {
+      const d = String(s.domain || "").toLowerCase();
+      if (!d) return false;
+      if (tokens.some(t => t === d || t.endsWith("." + d) || (t.includes(".") && d.endsWith("." + t)))) return true;
+      const name = siteName(d);
+      return name.length >= 3 && !COMMON_WORDS.has(name) && tokens.includes(name);
+    });
+  }
+
+  // Those sites, and sites where a tracker company the question names was seen. When the question is about a company,
+  // at most one of its own sites (google.com, mail.google.com...) is shown in full, so the rest show where it followed you.
+  function focusSites(sites, question) {
+    if (!question) return [];
+    const named = namedSites(sites, question);
+    const L = (typeof window !== "undefined" ? window : self).AegisLists;
+    let byCompany = [];
+    if (L) {
+      const seenCos = new Set();
+      for (const s of sites) for (const t of s.trackers || []) if (t && t.company) seenCos.add(t.company);
+      const asked = new Set(companiesIn(question, [...seenCos]));
+      if (asked.size) byCompany = sites.filter(s => (s.trackers || []).some(t => t && asked.has(t.company)));
+    }
+    const ownSites = byCompany.length ? named.slice(0, 1) : named;
+    return [...new Set([...ownSites, ...byCompany, ...named])];
+  }
+
+  const yearOf = (b) => String(b.breachDate || b.addedDate || "").slice(0, 4);
+  const ADVERSARY = new Set(["CN", "HK", "RU", "IR", "CU", "KP", "VE"]);   // 15 CFR 7.4 (same list as shared/data.js)
+  const more = (list, max) => (list.length > max ? `; and ${list.length - max} more` : "");
+
+  // Totals and cross-site lists over every site, so questions like "which data brokers have seen me?" or
+  // "which sites sell my data?" are answered from all of your browsing, not only the sites shown in full.
+  // lists = data.lists from AegisData.load(): when the broker registry was never downloaded, nothing is said
+  // about brokers (an unknown is never shown as safe: docs/SPEC.md Honesty rules).
+  function overview(sites, extra, lists) {
+    const grades = { A: 0, B: 0, C: 0, D: 0, F: 0 };
+    const choices = { declined: 0, accepted: 0, "no-reject": 0, none: 0 };
+    const byCo = new Map(), brokers = new Map(), fingerprint = new Map();
+    const breached = [], flagged = [], sells = [], shares = [];
+    for (const s of sites) {
+      if (grades[s.grade] !== undefined) grades[s.grade]++;
+      choices[s.cookieChoice in choices ? s.cookieChoice : "none"]++;
+      const why = new Map();
+      for (const t of s.trackers || []) {
+        if (!t || !t.company) continue;
+        let x = byCo.get(t.company);
+        if (!x) byCo.set(t.company, (x = { sites: new Set(), category: t.category, country: t.country }));
+        x.sites.add(s.domain);
+        if (t.broker) {
+          let b = brokers.get(t.broker);
+          if (!b) brokers.set(t.broker, (b = { company: t.company, sites: [] }));
+          if (!b.sites.includes(s.domain)) b.sites.push(s.domain);
+        }
+        if ((t.fingerprinting || 0) >= 2) { let f = fingerprint.get(t.company); if (!f) fingerprint.set(t.company, (f = new Set())); f.add(s.domain); }
+        const listed = t.listed || listedCompany(t.company, extra);
+        const inCountry = ADVERSARY.has(t.country);
+        if (inCountry || listed) why.set(t.company, `${t.company} (${[inCountry ? countryName(t.country) : null, listed ? "Section 1260H list" : null].filter(Boolean).join("; ")})`);
+      }
+      for (const t of s.flagged || []) if (t && t.company && !why.has(t.company)) why.set(t.company, `${t.company} (${countryName(t.country)})`);
+      if (s.owner && ADVERSARY.has(s.owner.country)) why.set("owner", `the site belongs to ${s.owner.company} (${countryName(s.owner.country)}${s.owner.stateMedia ? ", state-run media" : ""})`);
+      if (s.addressFlag) why.set("address", `web address ends in ${s.addressFlag.ending} (${countryName(s.addressFlag.country)})`);
+      if (s.serverFlag) why.set("server", `server address registered in ${countryName(s.serverFlag.country)} (regional internet registry)`);
+      if (why.size) { const w = [...why.values()]; flagged.push(`${s.domain}: ${w.slice(0, 3).join(", ")}${w.length > 3 ? ` and ${w.length - 3} more` : ""}`); }
+      if (s.breach) {
+        const b = s.breach, kinds = (b.dataClasses || []).slice(0, 3).join(", ").toLowerCase();
+        breached.push(`${s.domain} (${b.title || b.name}, ${yearOf(b)}${b.pwnCount ? `, ${fmtCount(b.pwnCount)} accounts` : ""}${kinds ? `: ${kinds}` : ""})`);
+      }
+      const p = s.policy || {};
+      if (p.sells === true) sells.push(s.domain);
+      else if (p.shares === true) shares.push(s.domain);
+    }
+    const lines = [];
+    lines.push(`Your browsing with Aegis One on, last 7 days [Seen on your visit]: ${sites.length} sites; grades ${Object.entries(grades).map(([g, n]) => `${n} ${g}`).join(", ")}; ` +
+      `cookie banners: ${choices.declined} declined, ${choices.accepted} accepted, ${choices["no-reject"]} had no Reject button, ${choices.none} with no banner seen.`);
+    const top = [...byCo].sort((a, b) => b[1].sites.size - a[1].sites.size).slice(0, 10);
+    if (top.length) lines.push(`Companies seen on the most sites [Seen on your visit] [Tracker Radar]: ${top.map(([co, x]) => `${co} (${x.category}, ${x.country ? countryName(x.country) : "unknown country"}) on ${x.sites.size} of ${sites.length} sites`).join("; ")}.`);
+    const purposes = purposeLines(sites);
+    if (purposes) lines.push(purposes);
+    if (brokers.size) {
+      const list = [...brokers].map(([name, b]) => `${b.company} (registered as "${name}") on ${b.sites.length} site${b.sites.length > 1 ? "s" : ""}: ${b.sites.slice(0, 4).join(", ")}${b.sites.length > 4 ? "..." : ""}`);
+      lines.push(`Registered California data brokers seen [CA Broker Registry] [Seen on your visit]: ${list.slice(0, LIST_MAX).join("; ")}${more(list, LIST_MAX)}.`);
+    } else if (lists && lists.brokersAsOf) lines.push("No registered California data brokers seen [CA Broker Registry].");
+    if (flagged.length) lines.push(`Foreign-adversary links seen [Seen on your visit] [Government list]: ${flagged.slice(0, LIST_MAX).join("; ")}${more(flagged, LIST_MAX)}.`);
+    if (sells.length) lines.push(`Sites whose own privacy policy says they sell personal information [Privacy policy]: ${sells.slice(0, LIST_MAX).join(", ")}${more(sells, LIST_MAX)}.`);
+    if (shares.length) lines.push(`Sites whose own privacy policy says they share personal information with partners [Privacy policy]: ${shares.slice(0, LIST_MAX).join(", ")}${more(shares, LIST_MAX)}.`);
+    if (fingerprint.size) {
+      const fp = [...fingerprint].sort((a, b) => b[1].size - a[1].size).slice(0, 8);
+      lines.push(`Trackers that read device details to recognize you without cookies (fingerprinting) [Tracker Radar]: ${fp.map(([co, set]) => `${co} on ${set.size} site${set.size > 1 ? "s" : ""}`).join(", ")}.`);
+    }
+    if (breached.length) lines.push(`Sites you visited with a known data breach [HIBP]: ${breached.slice(0, 8).join("; ")}${more(breached, 8)}.`);
+    return lines.join("\n");
+  }
+
+  function shortLine(s) {
+    const cos = [...new Set((s.trackers || []).map(t => t.company).filter(Boolean))];
+    return `- ${s.domain}: grade ${s.grade}${gradeWords(s.grade)}, exposure ${s.score}/100, ${cos.length} tracker compan${cos.length === 1 ? "y" : "ies"}${cos.length ? ` (${cos.slice(0, 4).join(", ")}${cos.length > 4 ? "..." : ""})` : ""} [Seen on your visit]`;
+  }
+
+  // extra = { flagged, regtrack }: the checked fact files (optional; context still builds without them).
+  // question (optional): sites it names, and sites where companies it names were seen, are shown in full.
+  // The result always fits MAX_CONTEXT_CHARS (~4,000 tokens): short lines go first, then full-detail sites from
+  // the least risky, so Gemma's rules (which come first) are never pushed out of its context window.
+  function buildContext(data, today, facts, extra, question, history) {
+    const tidy = (s) => (Array.isArray(s.trackers) && s.trackers.some(t => !t) ? { ...s, trackers: s.trackers.filter(Boolean) } : s);
+    const sites = ((data && data.sites) || []).filter(Boolean).map(tidy).sort((a, b) => (b.score || 0) - (a.score || 0));
+    // Unchanging background first, then everything about this question: Ollama can reuse the start of the last prompt.
+    const date = `Today is ${today || new Date().toISOString().slice(0, 10)}.`;
+    const bg = BACKGROUND + rulesText() + regtrackLines(extra) + featureFacts(question) + (facts && facts.length ? `\n\nFacts about what you asked:\n${facts.join("\n")}` : "") + memoryText(history);
+    if (!sites.length) return `${date}\n${bg}\n\nThe person hasn't visited any sites with Aegis One on yet.`;
+    // Sites the question names first, then sites named in the last few questions (for follow-ups like "its cookies").
+    const earlier = recent(history).map(t => t.question).reverse().join(" ");
+    const detail = [...new Set([...focusSites(sites, question), ...focusSites(sites, earlier), ...sites])].slice(0, DETAIL_SITES);
+    const shown = new Set(detail);
+    const rest = sites.filter(s => !shown.has(s));
+    const short = rest.slice(0, SHORT_SITES);
+    const head = `${date}\n${bg}\n\n${overview(sites, extra, data && data.lists)}\n\n`;
+    const detailLines = detail.map(s => [s, siteLine(s, extra)]);
+    const shortLines = short.map(shortLine);
+    const build = () => {
+      const d = [...detailLines].sort((a, b) => (b[0].score || 0) - (a[0].score || 0));
+      const left = sites.length - d.length - shortLines.length;
+      return head +
+        `Sites you visited, riskiest first (${sites.length}${sites.length > d.length ? `; full details for ${d.length}` : ""}):\n${d.map(x => x[1]).join("\n")}` +
+        (shortLines.length ? `\n\nNext riskiest sites:\n${shortLines.join("\n")}` : "") +
+        (left > 0 ? `\n(and ${left} more sites with lower exposure)` : "");
+    };
+    let text = build();
+    while (text.length > MAX_CONTEXT_CHARS && (shortLines.length || detailLines.length > 1)) {
+      if (shortLines.length) shortLines.pop(); else detailLines.pop();   // the question's own sites come first, so they stay
+      text = build();
+    }
+    return text;
+  }
+
+  // ---------- Keeping Aegis on topic (repo owner, 2026-10-24) ----------
+  // Steps ("What you can do:") only when the person asks for advice or about a risk; Gemma added them to almost
+  // every answer. Questions about Aegis itself and requests that have nothing to do with privacy get Aegis's own
+  // answer without asking Gemma, which otherwise talks like a general chatbot ("I can write a poem").
+  const WANTS_STEPS = /\b(should (i|we)|worr\w*|safe\w*|unsafe|danger\w*|risk\w*|protect\w*|stop|avoid|block\w*|remov\w*|delet\w*|opt[- ]?out|prevent\w*|what (can|should) i do|how (do|can|should) i|hack\w*|breach\w*|leak\w*|pwn\w*|scam\w*)\b/i;
+  const ABOUT_C = /^\s*(?:(?:what|how)\s+(?:else\s+)?(?:can|could|do)\s+you\s+(?:do|help)\b|what\s+(?:can|could)\s+you\s+help(?:\s+me)?\s+with\b|(?:who|what)\s+are\s+you\b|what\s+are\s+you\s+able\s+to\s+do\b|what\s+(?:can|should)\s+i\s+ask\b|how\s+do(?:es)?\s+(?:you|ask aegis|aegis(?:\s+one)?)\s+work\b|help)\s*(?:you|for\s+me|here|exactly|me\s+with)?\s*[?!.]*\s*$/i;   // the whole question, so "What can you do about X?" goes to Gemma
+  const OFF_TOPIC_THING = /\b(poems?|poetry|haikus?|songs?|lyrics|stor(?:y|ies)|essays?|jokes?|riddles?|recipes?|homework|code|python|javascript|programs?)\b/i;
+  const OFF_TOPIC_ASK = /\b(write|compose|make|generate|tell|give|create|sing)\b/i;
+  const PRIVACY_WORDS = /privacy|data|cookie|track|site|broker|breach|grade|polic|\.[a-z]{2,}\b/i;
+  // What Aegis One does and what Aegis can do (Preston, Oct 25: "better answers when asked about its own functionality and its
+  // possibilities"). From PRIVACY.md and the features themselves; Aegis One doesn't block anything, so Aegis never says it does.
+  const ABOUT_ANSWER = "I'm Aegis, Aegis One's privacy guide. Here's what Aegis One does for you:\n" +
+    "- On each site you visit, it shows which companies' trackers loaded and grades the site A to F by how much of your data it exposes. The pop-up lists every point and where it came from.\n" +
+    "- On cookie banners, I offer to click the reject option for you (\"Protect me\") and check the site's own consent record that it worked. On a banner with only an Accept button, I warn you (\"Beware!\").\n" +
+    "- I alert you when a site loads a company from a country on the U.S. foreign-adversary list, and warn you before you stay on an F site that also has one, or a data breach reported in the last year.\n" +
+    "- The dashboard shows your week: who followed you across sites, what their trackers were for, data breaches, registered data brokers, and what I did for you. \"Clear this site's data\" in the pop-up makes Chrome forget a site's cookies and storage.\n" +
+    "- Ask me about any of it: why a site got its grade, who a tracker company is, which of your sites had a data breach. My answers are written by Gemma 4, running on this computer, so your questions stay here.\n" +
+    "Aegis One doesn't block trackers or ads: it shows you who's there and helps you say no to cookie tracking. Try asking: \"Which of my sites had a recent data breach?\"";
+  // "How safe are you Aegis One?" (Preston, real Gemma, Oct 25) got "Aegis One helps you manage cookies and block trackers": it
+  // doesn't block anything. Questions about whether Aegis One itself is safe get its own answer, from PRIVACY.md and the
+  // permissions in manifest.json (docs/STORE.md explains each one).
+  const ME = String.raw`(?:aegis(?:\s+one)?|you|ask\s+aegis|this\s+(?:extension|app|add-?on|plug-?in|tool)|the\s+(?:aegis(?:\s+one)?\s+)?(?:extension|app|add-?on|plug-?in))`;
+  const AEGIS_SAFE_Q = [
+    new RegExp(String.raw`\bhow\s+(?:safe|secure|private|trustworthy|trusted)\s+(?:are\s+you|is\s+${ME})\b`, "i"),
+    new RegExp(String.raw`\b(?:is|are)\s+${ME}\s+(?:really\s+|actually\s+|even\s+)?(?:safe|secure|private|trustworthy|legit\w*|spyware|malware|a\s+virus|malicious|sketchy|shady|dangerous|a\s+scam)\b`, "i"),
+    new RegExp(String.raw`\b(?:can|should|do)\s+i\s+trust\s+${ME}\s*[?.!]*\s*$`, "i"),
+    new RegExp(String.raw`\bis\s+(?:it|my\s+(?:data|browsing|information|info|privacy))\s+safe\s+(?:to\s+use\s+|with\s+|in\s+|using\s+)${ME}\b`, "i"),
+    new RegExp(String.raw`\bpermissions?\b[^?.!]*\b${ME}\b|\b${ME}\b[^?.!]*\bpermissions?\b|\bwhy\s+(?:does|do)\s+${ME}\s+need\b`, "i"),
+    /\bread\s+and\s+change\s+all\b/i
+  ];
+  // What Aegis One keeps (PRIVACY.md), in every answer that says so.
+  const KEEPS = "It keeps site names (never the addresses of the pages you visit), which tracker companies each site loaded, cookie names (never what's inside them), your cookie-banner choices, and what each site's privacy policy says with the address of its privacy-policy page. It deletes each site 7 days after your last visit, and never reads your passwords or what you type into websites.";
+  const SAFE_ANSWER = "Here's exactly what Aegis One can and can't do:\n" +
+    "- It runs on this computer. Aegis One has no servers, no accounts, no ads and no analytics, and the Aegis One team never sees your data. What it learns about your browsing stays in Chrome's storage, and my answers are written by Gemma 4 running here, so your questions stay here too.\n" +
+    `- ${KEEPS}\n` +
+    "- It downloads only whole public lists (data breaches and data brokers) and my AI model, the same files for everyone, so no site names are sent anywhere. It reads a site's privacy policy from that same site, without your cookies.\n" +
+    "- Chrome says it can \"Read and change all your data on all websites\": Aegis One needs that to see which trackers each page loads, find cookie banners, and show Aegis and the grade box. On a page it only clicks a cookie banner's reject option when you let it (or turn on automatic), and a \"Do not sell or share my personal information\" button when a page shows one. It deletes a site's cookies only when you tap \"Clear\" twice in the pop-up.\n" +
+    "- It doesn't block trackers or ads: it shows you who's there and helps you say no.\n" +
+    "You can delete everything Aegis One keeps with Settings > \"Clear my Aegis One data\".";
+  // "How do you work?": the steps behind every grade and answer.
+  const HOW_Q = new RegExp(String.raw`^\s*how\s+(?:do(?:es)?\s+${ME}\s+(?:work|decide|grade|score|know|find\s+out|check)\b(?!\s+(?:that|if|whether)\b)|(?:does|do)\s+${ME}\s+(?:decide|calculate|work\s+out|come\s+up\s+with)\b)[^?]*[?.!]*\s*$`, "i");
+  const howAnswer = (q) => "Here's how Aegis One works, all on this computer:\n" +
+    "1. While a page loads, it notes which outside addresses the page contacts and looks them up in DuckDuckGo's Tracker Radar, a public list of thousands of tracker addresses and the companies behind them. It lists the site's cookies by name with the Open Cookie Database, notes your cookie-banner choice, and reads the site's privacy policy when a page links to it.\n" +
+    "2. It checks public lists: Have I Been Pwned's data breaches, California's Data Broker Registry, the U.S. foreign-adversary list (15 CFR 7.4) and the Pentagon's Section 1260H list.\n" +
+    `3. It adds that up into an exposure score from 0 to 100, with the same rules for every site (${GRADE_RANGES}). The pop-up shows every point and its source.\n` +
+    "4. When you ask me something, Aegis One's code looks up the facts in your records, and Gemma 4, running on this computer, writes the answer with each fact's source.\n" +
+    "Nothing about your browsing leaves this computer." + gradeRules(q);
+  // "How do you calculate the grade?": every rule, from shared/data.js (the same table as the dashboard's "How the grade works").
+  function gradeRules(q) {
+    const D = (typeof window !== "undefined" ? window : self).AegisData;
+    if (!D || !D.RULES || !/\b(?:grade|grading|score|scoring|calculat\w*|points?|rat(?:e|es|ing))\b/i.test(q)) return "";
+    return "\n\nHow the grade is counted (higher means more exposed):\n" + ["trackers", "ads", "cookies", "flag", "policy", "breach"].map((k) => `- ${D.RULES[k]}.`).join("\n");
+  }
+  // "What is Aegis One?", "What does Aegis One do?", "What are your features?" (the whole question, like ABOUT_C).
+  const ABOUT_AEGIS = /^\s*(?:what\s+(?:is|does|can)\s+(?:aegis(?:\s+one)?|this\s+extension|the\s+extension)(?:\s+do)?(?:\s+for\s+me)?|what\s+are\s+(?:aegis'?s|your|its|the\s+extension'?s)\s+features|tell\s+me\s+about\s+(?:aegis(?:\s+one)?|yourself|this\s+extension)|what\s+are\s+you\s+capable\s+of)\s*[?.!]*\s*$/i;
+  // "How safe are you Aegis One?", "What can you do, Aegis?": the name at the end is only calling C.
+  const CALLING_C = /[,\s]+aegis(?:\s+one)?\s*([?.!]*)\s*$/i;
+  const OFF_TOPIC_ANSWER = "I stick to your privacy, so I can't help with that one. Try asking me about a site you visited, " +
+    "a tracker company, or whether to accept cookies.";
+  // "Are you made with gemma" got "You are not made with Gemma" (real Gemma, 2026-10-24). Questions about what Aegis is or runs on
+  // get this fixed answer. Each pattern needs C ("you", "C", "Aegis One", "Ask Aegis") or the model itself, so "Is my data sent to
+  // Google?" or "What can you tell me about Google?" (questions about trackers) still go to Gemma.
+  const MODEL_WORDS = /\b(gemma|llms?|large language models?|language models?|ai models?|litert)\b/i;
+  const ABOUT_MODEL = [
+    /\b(?:are|were)\s+you\s+(?:an?\s+)?(?:ai|a\.i\.|bot|chatbot|robot|human|person|real(?:\s+person)?|chatgpt|gpt|gemini|claude|llama|model|llm)\b/i,
+    /\b(?:are|were)\s+you\s+(?:made|built|powered|trained|running|created)\b/i,
+    /\b(?:who|what)\s+(?:made|built|created|trained|powers|runs)\s+(?:you|aegis(?:\s+one)?|ask\s+aegis)\b/i,
+    /\bwhat\s+(?:ai|model|llm|brain)\s+(?:are|is|runs|powers|do)\b/i,
+    /\b(?:do|does)\s+(?:you|aegis(?:\s+one)?|ask\s+aegis)\s+(?:use|run\s+on|send|share|upload|store)\b[^?.!]*\b(?:ai|model|google|openai|my\s+(?:questions?|data|browsing|chats?)|anywhere|online|cloud)\b/i,
+    /\b(?:is|are)\s+my\s+(?:data|questions?|browsing|chats?)\s+(?:sent|shared|uploaded|stored)\b[^?.!]*\b(?:when\s+i\s+ask\s+you|to\s+you|ask\s+aegis|aegis(?:\s+one)?|gemma|the\s+ai)\b/i
+  ];
+  const MODEL_ANSWER = "I'm Aegis, Aegis One's privacy guide, and my answers are written by Gemma 4, Google's open AI model (released March 31, 2026), " +
+    "running on this computer: inside Chrome on your graphics chip (Gemma 4 E2B with Google's LiteRT-LM), or in the Ollama app if you picked it. " +
+    "I'm not an online chatbot: your questions and browsing never leave this computer, and nothing is sent to Google or any AI company. " +
+    "Gemma only writes the words. The grades, tracker lists, breach records and government lists come from Aegis One's own code and public data, " +
+    "and each fact shows its source.";
+  // "Does my browsing leave my computer?": Gemma answered "Yes, your questions and browsing never leave your computer"
+  // (G14, 2026-10-25). Aegis One's privacy promise is answered in its own words (PRIVACY.md).
+  const PRIVATE_Q = /\b(?:leave|leaves|leaving)\s+(?:my|this|the)\s+(?:computer|device|laptop|machine|pc|mac|browser)\b|\b(?:do|does|will|can)\s+(?:you|aegis(?:\s+one)?|ask\s+aegis|the\s+extension)\s+(?:see|read|sell|collect|keep|save|track)\b[^?.!]*\b(?:passwords?|data|browsing|history|questions?|me|type|typing|e-?mails?|messages?|my\s+screen)\b/i;
+  const PRIVATE_ANSWER = "No. What Aegis One learns about your browsing stays on this computer, in Chrome's storage, and my answers are written by Gemma " +
+    "running here (inside Chrome, or in the Ollama app on this computer), so your questions stay here too. Aegis One never reads your passwords " +
+    "or what you type into websites. It only downloads whole public lists (data breaches and data brokers) and my AI model, the same files for " +
+    "everyone, and it reads a site's privacy policy from that same site, without your cookies. The Aegis One team has no servers and never sees " +
+    "your data. The sites you visit and their trackers do see your visits: showing you who they are is Aegis One's job.";
+  // "What makes u so special" got Gemma reading its own instructions back: "You are special because you are a privacy guide
+  // for the Aegis One browser extension..." (Max, real Gemma on the Mac, 2026-10-25). Text-speak is spelled out first ("u" ->
+  // "you"), then questions about what makes Aegis different, his purpose, greetings and thanks get Aegis's own answer.
+  const TEXT_SPEAK = [[/\bu\b/gi, "you"], [/\bur\b/gi, "your"], [/\br\b/gi, "are"], [/\bwat\b/gi, "what"], [/\by(?=\s+(?:are|is|should|would|do)\b)/gi, "why"]];
+  const spelledOut = (q) => TEXT_SPEAK.reduce((t, [re, w]) => t.replace(re, w), q);
+  const GOOD = String.raw`(?:so\s+|any\s+)?(?:special|different|unique|better|good|great|useful)`;
+  const SPECIAL_Q = new RegExp(String.raw`^\s*(?:what(?:'s|\s+is)?\s+(?:makes|made)\s+${ME}\s+${GOOD}|why\s+(?:are|is)\s+${ME}\s+${GOOD}|what(?:'s|\s+is)\s+(?:so\s+)?(?:special|different|unique|great|good)\s+about\s+${ME}|why\s+(?:should|would)\s+i\s+(?:use|pick|choose|download|install|get)\s+${ME}|how\s+(?:are|is)\s+${ME}\s+${GOOD}\b[^?.!]*)\s*[?.!]*\s*$`, "i");
+  const PURPOSE_Q = new RegExp(String.raw`^\s*(?:what(?:'s|\s+is)\s+(?:your|aegis(?:\s+one)?'?s)\s+(?:purpose|job|point|goal|mission|role|deal)|why\s+do\s+${ME}\s+exist)\s*[?.!]*\s*$`, "i");
+  const SPECIAL_ANSWER = "I'm Aegis, Aegis One's privacy guide. Here's what makes Aegis One different:\n" +
+    "- I don't just tell you to say no to cookies: on a cookie banner I click the reject option for you (\"Protect me\"), then check the site's own consent record that it worked.\n" +
+    "- Every site gets a grade from A to F, and the pop-up shows every point and where it came from. Anything Aegis One couldn't check says so, instead of calling the site safe.\n" +
+    "- I name companies on official U.S. lists with the list and its date, and I never guess where your data went.\n" +
+    "- My answers are written by Gemma 4 running on this computer, so your browsing and your questions stay here.\n" +
+    "Aegis One doesn't block trackers or ads: it shows you who's there and helps you say no. Try asking: \"Who tracked me the most this week?\"";
+  const GREETING = /^\s*(?:hi+|hey+|hello+|helo|yo|sup|hiya|howdy|good\s+(?:morning|afternoon|evening))(?:\s+(?:there|aegis(?:\s+one)?))?\s*[!.?,]*\s*$/i;
+  const GREETING_ANSWER = "Hi! I'm Aegis. Ask me about any site you visited, a tracker company, or whether to accept cookies. Try: \"Which of my sites had a recent data breach?\"";
+  const THANKS = /^\s*(?:thanks?(?:\s+(?:you|so\s+much|a\s+lot))?|thank\s+you(?:\s+so\s+much)?|thx|ty|tysm|ok(?:ay)?(?:\s+(?:cool|thanks?))?|cool|nice|great|got\s+it|awesome|perfect)(?:\s+(?:aegis(?:\s+one)?))?\s*[!.,]*\s*$/i;
+  const THANKS_ANSWER = "Anytime! Ask me anything else about a site, a tracker company or your cookies.";
+  // Gemma's instructions read back as an answer ("I am a privacy guide for the Aegis One browser extension. I only help with
+  // privacy."): replaced with Aegis's own words.
+  const ECHOED_RULES = [
+    /\b(?:you|i)\s+(?:are|am)\s+(?:aegis,?\s+)?(?:a\s+|the\s+)?(?:friendly\s+)?privacy\s+guide\b/i,
+    /\b(?:you|i)\s+(?:are|am)\s+only\s+aegis(?:\s+one)?'?s\b/i,
+    /\byou\s+only\s+help\s+with\s+privacy\b/i,
+    /\bas\s+aegis(?:\s+one)?'?s\s+privacy\s+guide,\s+you\b/i
+  ];
+  const echoesRules = (t) => ECHOED_RULES.some((re) => re.test(t));
+  const ECHO_ANSWER = "I'm Aegis, Aegis One's privacy guide. I can tell you which companies saw your visits, why a site got its grade, " +
+    "whether a site had a data breach, and whether to accept cookies. Try asking: \"Who tracked me the most this week?\"";
+  // "You" means C (Preston, Oct 25: C "repeats back 'You' to the user with something unrelated"). Gemma's rule is to call the
+  // person "you", so "Are you tracking me?" or "Are you there?" got answers about the person or the rules read back. The
+  // common questions to Aegis get Aegis's own answer (PRIVACY.md, TERMS.md); "Are you recording my screen?" no longer gets the
+  // dashboard's list of sites that record screens.
+  const C_ME = String.raw`(?:${ME})`;
+  const TRACKING_ME_Q = new RegExp(String.raw`^\s*(?:are|were|is)\s+${C_ME}\s+(?:secretly\s+|also\s+|really\s+)?(?:tracking|spying(?:\s+on)?|watching|monitoring|following|recording|logging|collecting|stealing|selling)\s+(?:me|my|what\s+i|everything|where\s+i)\b[^?.!]*[?.!]*\s*$`, "i");
+  const NOT_TRACKER_ANSWER = "No. I don't track you or record your screen: what Aegis One learns about your browsing stays on this computer, " +
+    `in Chrome's storage, and the Aegis One team never sees it. ${KEEPS} To see who does track you, ask: "Who tracked me the most this week?"`;
+  const KNOW_ME_Q = new RegExp(String.raw`^\s*(?:what\s+(?:do|does)\s+${C_ME}\s+(?:know|keep|store|save|remember|have|collect)\s+(?:about|on|from)\s+me` +
+    String.raw`|what\s+(?:data|information|info|details|records?)\s+(?:do|does)\s+${C_ME}\s+(?:have|keep|store|save|collect)(?:\s+(?:about|on|from)\s+me)?` +
+    String.raw`|(?:do|does|will|would|can)\s+${C_ME}\s+know\s+(?:what\s+(?:sites|websites|pages)\s+i|which\s+(?:sites|websites)\s+i|where\s+i|(?:everything\s+)?about\s+me|who\s+i\s+am|me\b|my\s+(?:history|browsing|name|sites|data|searches))` +
+    String.raw`|(?:do|does|will|would|can)\s+${C_ME}\s+(?:keep|store|save|remember|log|record)\s+(?:my\s+(?:history|browsing|sites|websites|visits|data|information|info|searches|questions|chats?|conversations?)|what\s+i|everything|this\s+(?:conversation|chat)|our\s+(?:conversation|chat)|the\s+(?:sites|websites|pages)\s+i)` +
+    String.raw`|(?:can|could|will|would)\s+${C_ME}\s+forget\s+(?:what\s+i|everything|me\b|my\s+(?:history|browsing|data|questions)|this\s+(?:conversation|chat)|our\s+(?:conversation|chat)))[^?.!]*[?.!]*\s*$`, "i");
+  const KNOWS_ANSWER = `Only what Aegis One saw in this browser, and it stays on this computer. ${KEEPS} I use your last 3 questions to follow ` +
+    "the conversation while this page is open, and nothing you ask me is saved. You can delete everything Aegis One keeps with Settings > \"Clear my Aegis One data\".";
+  const HERE_Q = /^\s*(?:are\s+)?you\s+(?:still\s+)?(?:there|here|on|working|awake|alive|online|ready|listening|ok|okay|up)\s*[?.!]*\s*$/i;
+  const HERE_ANSWER = "I'm here! Ask me about any site you visited, a tracker company, or whether to accept cookies. Try: \"Which of my sites had a recent data breach?\"";
+  const HOW_ARE_YOU_Q = /^\s*(?:how\s+are\s+you(?:\s+doing)?(?:\s+today)?|how(?:'s|\s+is)\s+it\s+going|what(?:'s|\s+is)\s+up|how\s+have\s+you\s+been)\s*[?.!]*\s*$/i;
+  const HOW_ARE_YOU_ANSWER = "I'm doing well, thanks for asking! Ask me about any site you visited, a tracker company, or whether to accept cookies.";
+  const HELP_Q = /^\s*(?:(?:can|could|will|would)\s+you\s+help(?:\s+me)?(?:\s+(?:out|please))?|what(?:'s|\s+is)\s+your\s+name|do\s+you\s+have\s+a\s+name)\s*[?.!]*\s*$/i;
+  const ACCURATE_Q = new RegExp(String.raw`^\s*(?:how\s+(?:accurate|reliable|correct|precise)\s+(?:are\s+(?:you|your\s+(?:answers|grades|facts))|is\s+${C_ME})` +
+    String.raw`|(?:are|is)\s+(?:${C_ME}|your\s+(?:answers|grades|facts))\s+(?:always\s+|really\s+|even\s+)?(?:accurate|reliable|correct|right)` +
+    String.raw`|(?:do|does|can|could)\s+${C_ME}\s+(?:ever\s+)?(?:make\s+mistakes|get\s+(?:it|things)\s+wrong|be\s+wrong))\s*[?.!]*\s*$`, "i");
+  const ACCURATE_ANSWER = "My facts are as accurate as their sources, and each one shows its source: what Aegis One saw on your visits, DuckDuckGo's " +
+    "Tracker Radar, Have I Been Pwned, California's Data Broker Registry, the Open Cookie Database, each site's own privacy policy and the U.S. " +
+    "government lists. Every site's grade follows the same rules, and anything Aegis One couldn't check is marked \"Partly checked\" instead of " +
+    "being counted as safe. My words are written by Gemma, a small AI model on this computer, and it can still word things wrongly, so the " +
+    "pop-up's list of points is the place to check a grade.";
+  // G14 (real Gemma, 23755e9): "Do you work offline?" got only Aegis's general intro.
+  const OFFLINE_Q = new RegExp(String.raw`^\s*(?:(?:do|does|can|will)\s+${C_ME}\s+(?:still\s+)?(?:work|run)\s+(?:offline|without\s+(?:the\s+)?(?:internet|wi-?fi|a\s+connection))|(?:do|does)\s+${C_ME}\s+need\s+(?:the\s+)?(?:internet|wi-?fi|a\s+connection|to\s+be\s+online))\s*[?.!]*\s*$`, "i");
+  const OFFLINE_ANSWER = "Mostly, yes. Aegis One's tracker and cookie lists come with it, and once my AI model is downloaded I answer on this computer " +
+    "without the internet. The data-breach and data-broker lists refresh once a day when you're online, and reading a site's privacy policy " +
+    "needs that site, so those wait until you're back online.";
+  const COST_Q = new RegExp(String.raw`^\s*(?:(?:is|are)\s+${C_ME}\s+(?:really\s+|completely\s+|totally\s+)?free|(?:do|does)\s+${C_ME}\s+cost(?:\s+(?:money|anything))?` +
+    String.raw`|how\s+much\s+(?:do|does)\s+${C_ME}\s+cost)\s*[?.!]*\s*$`, "i");
+  const COST_ANSWER = "Aegis One is free. There are no accounts, payments, ads or paid features, and the Aegis One team never sees your data.";
+  const LOVE_Q = /^\s*(?:i\s+(?:love|like|adore)\s+you(?:\s+(?:so\s+much|a\s+lot))?|you(?:'re|\s+are)\s+(?:the\s+best|so\s+(?:cool|helpful|smart|great|cute)|awesome|amazing|great|helpful|cool|smart|cute|nice))\s*[!.]*\s*$/i;
+  const LOVE_ANSWER = "Thank you! Ask me anything else about a site, a tracker company or your cookies.";
+  const WRONG_Q = /^\s*(?:you(?:'re|\s+are)\s+(?:wrong|incorrect|mistaken)|that(?:'s|\s+is)\s+(?:wrong|incorrect|not\s+(?:true|right))|you\s+(?:got|have)\s+(?:it|that)\s+wrong)\b[^?]*[.!]*\s*$/i;
+  const WRONG_ANSWER = "Sorry about that. My facts come from Aegis One's records and public lists, but Gemma, the AI that writes my words, can get the " +
+    "wording wrong. Each site's pop-up lists every point of its grade with its source, so check it there, and ask me about the exact part that looks wrong.";
+  // Other questions to Aegis ("Can you protect me?", "Why are you showing me this?") still go to Gemma, with a note saying who
+  // "you" is and Aegis One's facts. Requests ("Can you tell me about Google?"), opinions ("Do you think...") and "you" meaning
+  // anyone ("How do you clear cookies?", "Should you worry about Criteo?") keep the usual evidence.
+  const TO_C = /^\s*(?:(?:are|were|do|did|have|will|would|can|could)\s+you\b(?!\s+(?:please\s+)?(?:tell|explain|show|list|give|find|check|look|compare|summari[sz]e|describe|define|say|name|recommend|suggest|think|know|believe|reckon|mean)\b)|why\s+(?:are|were|do|did|have|would|can't|cannot|won't|don't|didn't)\s+you\b|what\s+(?:are|were|have|did)\s+you\s+(?:doing|done|found|blocked|declined|stopped|caught|seen|saved)\b)/i;
+  const toC = (q) => TO_C.test(spelledOut(String(q || "")));
+  const TO_C_NOTE = `\n\nFor this question: the person is talking to you, Aegis. In their question, "you" and "your" mean you (Aegis, Aegis One), not them. Answer about yourself as "I", and say "you" only for the person.`;
+  // The Grades tab's "Explain this grading rule ..." buttons (dashboard.js) got instant record answers about your sites
+  // (G14, main 85007e5): the screen-recording list, "15 CFR 7.4" read as a site, the breach list. Each rule is explained
+  // from shared/data.js's RULES, the same words as the scoring, with a made-up example.
+  const RULE_Q = /^\s*explain this grading rule\b[^"]*"\s*([^"]+)/i;
+  const RULE_EXAMPLES = [
+    [/^tracking companies/i, "trackers", "For example, a news site that loads trackers from Google, Facebook and Criteo on most of your visits gets 15 points; one that loads 8 or more companies gets the full 40."],
+    [/^advertising/i, "ads", "For example, if two of the counted companies are Criteo (advertising) and Hotjar (screen recording), the site gets 10 more points."],
+    [/^cookie choice/i, "cookies", "For example, clicking \"Accept all\" on a site's cookie banner adds 10 points; letting Aegis decline the extras, with the site's own consent record confirming it, makes it 0."],
+    [/^listed country/i, "flag", "For example, a site that loads a tracker from Baidu, a company based in China that is also on the 1260H list, gets 15 points, and a second such company adds nothing more. It means the company could collect data, not that your data went to a government."],
+    [/^privacy policy/i, "policy", "For example, a policy that says \"we sell personal information\" adds 15 points, and one that says it shares your data with advertising partners adds 8."],
+    [/^site'?s data breaches/i, "breach", "For example, a site whose breach was added to Have I Been Pwned 6 months ago gets 15 points; one whose only breach was 8 years ago and smaller than 100 million accounts gets 0."]
+  ];
+  function ruleAnswer(asked) {
+    const m = asked.match(RULE_Q);
+    const D = (typeof window !== "undefined" ? window : self).AegisData;
+    const hit = m && D && D.RULES && RULE_EXAMPLES.find(([re]) => re.test(m[1].trim()));
+    if (!hit) return null;
+    return `${D.RULES[hit[1]]}.\n\n${hit[2]}\n\nEach site's own points are under "How this grade was calculated" on the Sites tab.`;
+  }
+  function cannedAnswer(asked) {
+    const rule = ruleAnswer(asked);
+    if (rule) return rule;
+    for (const q of [asked, asked.replace(CALLING_C, "$1"), spelledOut(asked), spelledOut(asked).replace(CALLING_C, "$1")]) {
+      if (GREETING.test(q)) return GREETING_ANSWER;
+      if (THANKS.test(q)) return THANKS_ANSWER;
+      if (HERE_Q.test(q)) return HERE_ANSWER;
+      if (HOW_ARE_YOU_Q.test(q)) return HOW_ARE_YOU_ANSWER;
+      if (LOVE_Q.test(q)) return LOVE_ANSWER;
+      if (WRONG_Q.test(q)) return WRONG_ANSWER;
+      if (SPECIAL_Q.test(q)) return SPECIAL_ANSWER;
+      if (PURPOSE_Q.test(q)) return ABOUT_ANSWER;
+      if (TRACKING_ME_Q.test(q)) return NOT_TRACKER_ANSWER;
+      if (KNOW_ME_Q.test(q)) return KNOWS_ANSWER;
+      if (PRIVATE_Q.test(q)) return PRIVATE_ANSWER;
+      if (MODEL_WORDS.test(q) || ABOUT_MODEL.some((re) => re.test(q))) return MODEL_ANSWER;
+      if (AEGIS_SAFE_Q.some((re) => re.test(q))) return SAFE_ANSWER;
+      if (ACCURATE_Q.test(q)) return ACCURATE_ANSWER;
+      if (COST_Q.test(q)) return COST_ANSWER;
+      if (OFFLINE_Q.test(q)) return OFFLINE_ANSWER;
+      if (HOW_Q.test(q)) return howAnswer(q);
+      if (ABOUT_C.test(q) || ABOUT_AEGIS.test(q) || HELP_Q.test(q)) return ABOUT_ANSWER;
+      if (OFF_TOPIC_THING.test(q) && OFF_TOPIC_ASK.test(q) && !PRIVACY_WORDS.test(q)) return OFF_TOPIC_ANSWER;
+    }
+    return null;
+  }
+  // "Why did planetfitness.com get a B?" (team doc, 2026-10-24: Aegis said "I don't know yet"). Answered from the score
+  // itself, the same lines as the popup's "Why it got a B", so the answer is always right and instant.
+  const GRADE_WORDS_Q = /\b(grade[sd]?|grading|scored?|scoring|rate[ds]?|rating)\b/i;
+  const GRADE_LETTER = /\b(?:get|gets|got|getting|has|have|had|is|was|earn|earned|receive|received|a|an)\s+(?:an?\s+)?["']?([A-Fa-f])["']?(?=[\s?.!,]|$)/;   // "get a d" too: people type in lowercase
+  const GRADE_RANGES = "A is 0-20, B is 21-40, Aegis is 41-60, D is 61-80, F is 81-100";
+  const article = (g) => (/^[AEF]/.test(g) ? "an" : "a");
+  // Fully / Partly checked, with how high the score could go (the popup says the same, shared/site-summary.js).
+  function checkedLine(r) {
+    const D = (typeof window !== "undefined" ? window : self).AegisData;
+    if (!r.unknowns || !r.unknowns.length || !r.range) return "Fully checked: every line of the grade has an answer. What companies do with data on their own servers is still unknown. [Seen on your visit]";
+    if (r.score >= 100) return `Partly checked: ${r.unknowns.join(", and ")}, but the score is already at the top (${r.score} out of 100), so that can't raise it. [${PART_TAG.disclosed}]`;
+    const worst = D.gradeFor(r.range.max);
+    const g = worst === r.grade ? `still ${article(worst)} ${worst}` : `${article(worst)} ${worst}`;
+    return `Partly checked: ${r.unknowns.join(", and ")}, so this could be as high as ${r.range.max} out of 100 (${g}). [${PART_TAG.disclosed}]`;
+  }
+  // "Why does CNN have a bad grade?": the "a" there is a word, not the letter A. A lowercase "a" is the letter only when
+  // nothing follows it, or "grade" does (backtest 2026-10-24: Aegis answered "cnn.com got a D, not an A").
+  function askedLetter(q) {
+    for (const m of String(q).matchAll(new RegExp(GRADE_LETTER.source, "g"))) {
+      if (m[1] !== "a") return m[1].toUpperCase();
+      const after = q.slice(m.index + m[0].length);
+      if (/^["']?\s*(?:grade\b|rating\b|[?.!,]|$)/i.test(after)) return "A";
+    }
+    return undefined;
+  }
+  // Every wording of "what's cnn.com's grade and why" gets the same answer: a site the person visited plus a grade word
+  // ("explain cnn.com's grade", "cnn grade?", "what made its score go up"), or "why is cnn so bad". Before, only
+  // questions starting with why/how did, and the rest went to Gemma and came back different each time.
+  const SO_BAD = /\bwhy\b[^?]*\b(?:so\s+)?(?:bad|poor|low|high|good|terrible|awful)\b/i;
+  function gradeIntent(q) { return GRADE_WORDS_Q.test(q) || SO_BAD.test(q) || (/\b(why|how)\b/i.test(q) && askedLetter(q) !== undefined); }
+  // A bare "why?" right after a question about one site's safety or grade is answered from that site's score lines
+  // (G14 real-Gemma run, Oct 25: Gemma answered "why?" after "Should I trust cnn?" with made-up facts).
+  const BARE_WHY = /^\s*(?:why|how come|why is that|why so|but why)\s*[?!.]*\s*$/i;
+  function gradeAnswer(q, sites, history) {
+    const last = recent(history).slice(-1)[0];
+    // "and espn?" after a grade question, a site's safety question or a bare "why?"
+    const followUp = !gradeIntent(q) && last && (gradeIntent(last.question) || SAFE_Q.test(last.question) || BARE_WHY.test(last.question)) && AND_ABOUT.test(q);
+    const aboutSite = (x) => gradeIntent(x) || SAFE_Q.test(x) || (OWN_TOPIC.test(x) && !BREACH_Q.test(x) && !SELL_Q.test(x));   // "What can I do about trackers on cnn.com?" too
+    const why = !!last && BARE_WHY.test(q) && aboutSite(last.question) && namedSites(sites, last.question).length === 1;
+    if (!gradeIntent(q) && !followUp && !why) return null;
+    const named = namedSites(sites, why ? last.question : q).slice(0, 3);
+    if (!named.length) {
+      const domain = (q.toLowerCase().match(/\b[a-z0-9-]+(?:\.[a-z0-9-]+)+\b/) || [])[0];
+      return domain ? `I haven't seen ${domain.replace(/^www\./, "")} with Aegis One on in the last 7 days, so it has no grade yet. ` +
+        "Open it with Aegis One on, then ask me again. [Seen on your visit]" : null;
+    }
+    const asked = followUp ? undefined : askedLetter(q);
+    const parts = named.map(s => [s, scoreParts(s)]);
+    if (parts.some(([, r]) => !r)) return null;
+    return parts.map(([s, r]) => {
+      const not = asked && asked !== r.grade && named.length === 1 ? `, not ${article(asked)} ${asked}` : "";
+      const head = `${s.domain} got ${article(r.grade)} ${r.grade}${not}: an exposure score of ${r.score} out of 100, ` +
+        `where higher means more of your data is exposed (${GRADE_RANGES}).`;
+      const body = r.counted.length
+        ? "What added points:\n" + r.counted.map(p => `- ${p.label} (+${p.points}) [${PART_TAG[p.kind] || PART_TAG.observed}]`).join("\n")
+        : "Nothing added points: no trackers or tracking cookies were counted, and no data breach or foreign-adversary link is on record. [Seen on your visit]";
+      return `${head}\n${body}\n${checkedLine(r)}`;
+    }).join("\n\n") + (named.length === 1 ? topicRules(q) : "");
+  }
+
+  // The dashboard's Ask Aegis button on a score line ('On cnn.com: what does "5 outside companies with trackers here" mean,
+  // and why is it worth 25 points?') is answered from that line's own rule (Justin, 2026-10-24: Aegis said "I don't know yet").
+  const PART_Q = /\bwhat does "([^"]+)" mean\b/i;
+  function partAnswer(q, sites) {
+    const m = q.match(PART_Q);
+    const s = m && namedSites(sites, q)[0];
+    const r = s && scoreParts(s);
+    const p = r && r.parts.find((x) => x.label === m[1]);
+    if (!p || !p.rule) return null;
+    return `"${p.label}" is one line of ${s.domain}'s exposure score [${PART_TAG[p.kind] || PART_TAG.observed}]. How it's counted: ${p.rule}. ` +
+      `Here it adds ${p.points} of ${s.domain}'s ${r.score} points (${r.grade}); higher means more of your data is exposed (${GRADE_RANGES}).`;
+  }
+  // "Why did cnn.com get a C for tracker connections?": the breakdown, plus how the lines the question names are counted.
+  const PART_TOPICS = [
+    [/\btrack|\bconnections?\b/i, "tracker lines are", ["trackers", "ads"]],
+    [/\bcookies?\b|\bbanners?\b/i, "cookie line is", ["cookies"]],
+    [/\bpolic(?:y|ies)\b|\bsell|\bshar(?:e|es|ing)\b/i, "privacy policy line is", ["policy"]],
+    [/\bbreach|\bhack|\bleak|\bpwn/i, "breach line is", ["breach"]],
+    [/\bforeign\b|\badversar|\bchin|\brussia|\b1260h\b/i, "foreign-adversary line is", ["flag"]]
+  ];
+  function topicRules(q) {
+    const D = (typeof window !== "undefined" ? window : self).AegisData;
+    if (!D || !D.RULES) return "";
+    return PART_TOPICS.filter(([re]) => re.test(q)).map(([, name, keys]) => `\nHow the ${name} counted: ${keys.map((k) => D.RULES[k]).join(". ")}.`).join("");
+  }
+  // Every rule once, for Gemma: so a rule question in any wording has its answer in the evidence.
+  function rulesText() {
+    const D = (typeof window !== "undefined" ? window : self).AegisData;
+    if (!D || !D.RULES) return "";
+    return `\n\nHow the grade is counted (higher means more exposed):\n` +
+      ["trackers", "ads", "cookies", "flag", "policy", "breach"].map((k) => `- ${D.RULES[k]}.`).join("\n") + `\nGrades: ${GRADE_RANGES}.` +
+      // Gemma tagged every rubric sentence [Seen on your visit] (G14, 2026-10-25).
+      `\nThese are Aegis One's own rules, the same for every site: they need no source tag.`;
+  }
+
+  const dropSteps = (text) => text.replace(/\s*What you can do:[\s\S]*$/i, "").trim();
+  // While Gemma is still writing: also hide a half-written "What you can..." at the very end, so the steps never
+  // flash up and then vanish when the answer finishes (Max, team doc).
+  const hideSteps = (text) => String(text || "").replace(/\s*What you can do\b[\s\S]*$/i, "").replace(/\s*\bWhat(?: you(?: can(?: do)?)?)?\s*$/i, "");
+
+  // A small memory: the last 3 questions and answers from this Ask Aegis session, cut short (dashboard/ask-c.js).
+  const MEMORY_TURNS = 3;
+  function recent(history) {
+    return (Array.isArray(history) ? history : [])
+      .filter(t => t && typeof t.question === "string" && typeof t.answer === "string")
+      .slice(-MEMORY_TURNS);
+  }
+  function memoryText(history) {
+    const turns = recent(history);
+    if (!turns.length) return "";
+    const cut = (s, n) => { s = s.replace(/\s+/g, " ").trim(); return s.length > n ? s.slice(0, n) + "..." : s; };
+    return "\n\nEarlier in this conversation (oldest first; only to understand follow-up questions):\n" +
+      // Without its "What you can do" steps: Gemma copied the same tips into every next answer.
+      turns.map(t => `- They asked: ${cut(t.question, 200)}\n  You answered: ${cut(dropSteps(t.answer), 300)}`).join("\n");
+  }
+
+  // In the extension, load the checked fact files once. Tests pass them in through deps.facts instead.
+  let FACT_FILES = null;
+  if (typeof chrome !== "undefined" && chrome.runtime && chrome.runtime.getURL && typeof fetch === "function") {
+    Promise.all(["shared/flagged-companies.json", "shared/regtrack-facts.json"].map(p => fetch(chrome.runtime.getURL(p)).then(r => r.json())))
+      .then(([flagged, regtrack]) => { FACT_FILES = { flagged, regtrack }; })
+      .catch(e => console.warn("Aegis One: fact files didn't load; Aegis answers without them", e));
+  }
+
+  const TAGS = ["Seen on your visit", "Tracker Radar", "CA Broker Registry", "HIBP", "RegTrack", "Privacy policy", "Government list", "Cookie Database", "State Media Monitor"];
+  const TAG_ALIASES = {
+    "sites visited": "Seen on your visit", "your browsing": "Seen on your visit", "browsing": "Seen on your visit",
+    "seen during your visit": "Seen on your visit", "observed": "Seen on your visit", "sample data": "Seen on your visit",
+    "policy": "Privacy policy", "tracker radar data": "Tracker Radar", "government": "Government list",
+    "government lists": "Government list", "background facts": "Government list", "15 cfr 7.4": "Government list",
+    "open cookie database": "Cookie Database", "cookies": "Cookie Database", "cookie db": "Cookie Database"
+  };
+
+  // The verb after "the user", changed to go with "you": has -> have, watches -> watch, carries -> carry.
+  // Words that aren't third-person verbs (can, will, should, not...) don't end in s, so they stay as they are.
+  const YOU_VERBS = { is: "are", was: "were", has: "have", does: "do", isn: "aren", wasn: "weren", hasn: "haven", doesn: "don" };
+  function youVerb(v) {
+    const w = v.toLowerCase();
+    if (YOU_VERBS[w]) return YOU_VERBS[w];
+    if (/(?:sses|shes|ches|xes|zes|oes)$/.test(w)) return v.slice(0, -2);
+    if (/[^aeiou]ies$/.test(w)) return v.slice(0, -3) + "y";
+    if (w.length > 3 && /[^su]s$/.test(w)) return v.slice(0, -1);
+    return v;
+  }
+
+  // Aegis repeating himself (backtest 2026-10-24): a small model at low temperature can say the same sentence twice, and
+  // with the conversation memory it says "Earlier I told you..." instead of answering. Both are taken out here.
+  const TOLD_YOU = /^(?:earlier(?: in (?:this|our) conversation)?,?\s+i\s+(?:told|said|mentioned|explained|shared)|i\s+(?:already\s+)?(?:told|mentioned|explained)\s+(?:you\s+)?(?:this\s+)?(?:earlier|before|already))\b/i;
+  const AS_I_SAID = /^as i (?:mentioned|said|explained|noted)(?: earlier| before)?,\s*/i;
+  function noRepeats(text) {
+    const seen = new Set();
+    return text.split(/\n{2,}/).map((para) => {
+      const out = [];
+      // Each line is its own piece, and each piece remembers whether a line break came before it: steps written one per
+      // line without dashes came out run together in one paragraph (Gemma 4 E4B, Mac, overnight Oct 25).
+      const parts = para.split(/((?<=[.!?])\s+(?=[A-Z"(\[])|(?<=\])\s+(?=[A-Z"(])|[ \t]*\n\s*)/);
+      let lineBreak = false;
+      for (let i = 0; i < parts.length; i += 2) {
+        const piece = parts[i];
+        lineBreak = lineBreak || (i > 0 && parts[i - 1].includes("\n"));
+        if (/^(\[[^\]]+\]\s*)+$/.test(piece)) { if (out.length && !out[out.length - 1].dropped) out[out.length - 1].text += " " + piece; continue; }
+        let sentence = piece.replace(AS_I_SAID, "");
+        if (sentence !== piece) sentence = sentence.charAt(0).toUpperCase() + sentence.slice(1);
+        const key = sentence.replace(/\[[^\]]+\]/g, "").replace(/\s+/g, " ").trim().toLowerCase();
+        const dropped = TOLD_YOU.test(sentence) || (key.length > 0 && seen.has(key));
+        if (key) seen.add(key);
+        out.push({ text: sentence, dropped, lineBreak });
+        if (!dropped) lineBreak = false;
+      }
+      return out.filter((x) => !x.dropped).map((x, i) => (i ? (x.lineBreak ? "\n" : " ") : "") + x.text).join("");
+    }).filter(Boolean).join("\n\n");
+  }
+
+  // Fix Gemma's small formatting slips so the panel shows clean labels and "you".
+  function cleanAnswer(text) {
+    let t = String(text || "").replace(/`/g, "").replace(/\*\*/g, "");
+    t = t.replace(/^(please )?note:? (that )?(this|the data provided) is (a )?sample[^.]*\.\s*/i, "");
+    t = t.replace(/\bthe user's\b/gi, "your");
+    // "the user has" -> "you have", not "you has" (docs/ASKC-FIXES.md Fix 2).
+    // Only when "the user" starts a sentence or clause (it's the subject); "data about the user goes" stays "about you goes".
+    t = t.replace(/(^|[.!?]\s+|\n\s*|\b(?:what|that|who|which|when|where|if|because|so|and|but|while|unless|whether)\s+)the user((?:\s+(?:also|always|often|still|never|just|already|usually|really|probably|only|then))?)\s+([a-z]+)\b/gi,
+      (m, pre, adv, v) => `${pre}you${adv} ${youVerb(v)}`);
+    t = t.replace(/\bthe user\b/gi, "you");
+    t = t.replace(/(^|[.!?]\s+)(you|your)\b/g, (m, pre, w) => pre + w[0].toUpperCase() + w.slice(1));
+    t = t.replace(/\[([^\]]{1,40})\]/g, (m, name) => {
+      const n = name.trim();
+      const exact = TAGS.find(x => x.toLowerCase() === n.toLowerCase());
+      if (exact) return `[${exact}]`;
+      const alias = TAG_ALIASES[n.toLowerCase()];
+      return alias ? `[${alias}]` : "";
+    });
+    t = t.replace(/(\[[^\]]+\])(\s*\1)+/g, "$1");           // same tag twice in a row
+    t = t.replace(/\s*(What you can do:)/i, "\n\n$1");       // steps on their own line
+    t = noRepeats(t);
+    return t.replace(/[ \t]+([.,;])/g, "$1").replace(/[ \t]{2,}/g, " ").trim();
+  }
+
+  // A half-written last sentence that starts like one Aegis already said stays hidden: if it turns out to be a repeat,
+  // it would be removed when the answer finishes; if not, it shows a word or two later.
+  function hideHalfRepeat(text) {
+    const m = text.match(/^([\s\S]*[.!?\]])\s+([^.!?\]]+)$/);
+    if (!m) return text;
+    const key = (s) => s.replace(/\[[^\]]*\]?/g, "").replace(/\s+/g, " ").trim().toLowerCase();
+    const tail = key(m[2]);
+    return tail && m[1].split(/(?<=[.!?])\s+/).some((s) => key(s).startsWith(tail)) ? m[1] : text;
+  }
+
+  // What Aegis checked, from the source tags in the answer: "Your browsing" first, then each source it cites.
+  function traceFor(text) {
+    const trace = [{ tool: "get_site_report", label: "Your browsing" }];
+    if (/\[Government list\]/.test(text)) trace.push({ tool: "background_facts", label: "Government lists" });
+    if (/\[Tracker Radar\]/.test(text)) trace.push({ tool: "lookup_company", label: "Tracker Radar" });
+    if (/\[Cookie Database\]/.test(text)) trace.push({ tool: "cookies", label: "Cookie Database" });
+    if (/\[HIBP\]/.test(text)) trace.push({ tool: "breaches", label: "Have I Been Pwned" });
+    if (/\[CA Broker Registry\]/.test(text)) trace.push({ tool: "brokers", label: "CA Broker Registry" });
+    if (/\[State Media Monitor\]/.test(text)) trace.push({ tool: "state_media", label: "State Media Monitor" });
+    if (/\[RegTrack\]/.test(text)) trace.push({ tool: "regtrack_compare", label: "RegTrack" });
+    return trace;
+  }
+
+  // The same question with the same evidence gets the same answer: Gemma picks its words with a fixed seed
+  // (with a random one, asking twice gave two different answers).
+  const SEED = 7;
+
+  // "What about puffco?" after "Was google hacked?" and "What about quest diagnostics?" went to Gemma: Aegis only looked one
+  // question back, and that one had no breach word (Max, real Gemma on the Mac, 2026-10-25). Now "what about X?" takes the
+  // last real question from the last 3 (skipping other "what about"s) and asks it about X, so the same lookups answer it.
+  const NOT_A_NAME = /\b(?:how|why|what|when|where|who|which|should|can|could|do|does|did|is|are|was|were|my|me|mine|i|you|your|we|our)\b/i;
+  const CARRY = [
+    [BREACH_Q, (x) => `Was ${x} hacked?`],
+    [SELL_Q, (x) => `Does ${x} sell my data?`],
+    [/\b(?:grade[sd]?|grading|scored?|rating)\b|\bget\s+an?\s+[A-F]\b/i, (x) => `Why did ${x} get its grade?`],
+    // Safety questions are left out: "and wired?" after "Should I trust cnn?" already gets wired's grade lines (gradeAnswer).
+    [/\bcollect\w*\b/i, (x) => `What is ${x} collecting about me?`],
+    [/^\s*who\s+(?:is|are|owns)\b/i, (x) => `Who is ${x}?`]
+  ];
+  function carryOver(q, history) {
+    if (!AND_ABOUT.test(q)) return q;
+    const x = q.replace(AND_ABOUT, "").replace(/[?.!,\s]+$/, "").trim();
+    if (!x || FOLLOW_UP.test(x) || x.split(/\s+/).length > 5 || NOT_A_NAME.test(x)) return q;
+    for (const t of recent(history).slice().reverse()) {
+      if (AND_ABOUT.test(t.question)) continue;
+      const hit = CARRY.find(([re]) => re.test(t.question));
+      return hit ? hit[1](x) : q;
+    }
+    return q;
+  }
+
+  async function answer(question, deps) {
+    const asked = String(question || "").trim();
+    if (!asked) return { error: "Type a question for Aegis first." };
+    const canned = cannedAnswer(asked);
+    if (canned) return { answer: canned, trace: [] };
+    const data = await deps.load();
+    const lists = deps.lists ? await deps.lists() : null;
+    const atlas = deps.atlas ? deps.atlas() : null;
+    // Names however they're typed ("tik tok", "you tube", "linkdin"), in the question and Aegis's memory (PLAN R19g/R19i).
+    const vocab = nameVocab(((data && data.sites) || []).filter(Boolean), lists, atlas);
+    const q = carryOver(fixNames(asked, vocab), deps.history);
+    deps = { ...deps, history: Array.isArray(deps.history) ? deps.history.map((t) => (t && typeof t.question === "string" ? { ...t, question: fixNames(t.question, vocab) } : t)) : deps.history };
+    const steps = WANTS_STEPS.test(q);
+    const graded = gradeAnswer(q, ((data && data.sites) || []).filter(Boolean), deps.history);
+    const policyWhy = policyWhyAnswer(q, ((data && data.sites) || []).filter(Boolean), deps.history);
+    if (policyWhy) return { answer: policyWhy, trace: [{ tool: "get_site_report", label: "Your browsing" }] };
+    const part = partAnswer(q, ((data && data.sites) || []).filter(Boolean));
+    if (part) return { answer: part, trace: [{ tool: "get_site_report", label: "Your browsing" }] };
+    if (graded) return { answer: graded, trace: [{ tool: "get_site_report", label: "Your browsing" }] };
+    const most = mostTrackedAnswer(q, ((data && data.sites) || []).filter(Boolean));
+    if (most) return { answer: most, trace: [{ tool: "get_site_report", label: "Your browsing" }] };
+    const extraFacts = deps.facts ? await deps.facts() : FACT_FILES;
+    const safe = safeAnswer(q, ((data && data.sites) || []).filter(Boolean), lists, atlas, extraFacts);
+    if (safe) return { answer: safe.text, trace: [{ tool: "get_site_report", label: "Your browsing" }, ...(safe.sources.includes("breach") ? [{ tool: "breaches", label: "Have I Been Pwned" }] : []),
+      ...(safe.sources.includes("broker") ? [{ tool: "brokers", label: "CA Broker Registry" }] : [])] };
+    const sells = sellAnswer(q, ((data && data.sites) || []).filter(Boolean));
+    if (sells) return { answer: sells, trace: [{ tool: "get_site_report", label: "Your browsing" }] };
+    const breach = breachAnswer(q, lists, deps.history, ((data && data.sites) || []).filter(Boolean), atlas, deps.now) || delayAnswer(q, lists);
+    if (breach) return { answer: breach, trace: [{ tool: "breaches", label: "Have I Been Pwned" }] };
+    // Where a dashboard item came from: screen recording, malware, data brokers, fingerprinting... (PLAN R19l).
+    const shown = dashboardAnswer(q, ((data && data.sites) || []).filter(Boolean), lists, data);
+    if (shown) return { answer: shown, trace: traceFor(shown) };
+    // A follow-up that names nothing ("does it fingerprint me?", "tell me more") keeps the last question's facts, so
+    // Aegis doesn't lose what he knows about Criteo one question later (backtest 2026-10-24).
+    let facts = lookupFacts(q, lists, atlas);
+    const last = recent(deps.history).slice(-1)[0];
+    // A question that names its own subject ("Who is Meta?", "Who owns zara.com?", "What is fingerprinting?") is answered
+    // without the earlier questions: they changed the prompt, so asking twice gave two different answers even with the
+    // fixed seed (real Gemma, 2026-10-25), and a short one got the last question's company ("Who owns zara.com?" got
+    // Baidu's facts after "Why is baidu.com flagged?", overnight backtest 2026-10-25).
+    const ownSites = namedSites(((data && data.sites) || []).filter(Boolean), q).length;
+    const follows = FOLLOW_UP.test(q) || AND_ABOUT.test(q);
+    const standalone = (facts.length || ownSites || OWN_TOPIC.test(q)) && !follows;
+    const followed = !facts.length && last && !ownSites && (follows || ((MORE_Q.test(q) || q.split(/\s+/).length <= 4) && !OWN_TOPIC.test(q))) ? last.question : "";
+    if (followed) facts = lookupFacts(followed, lists, atlas);
+    const subject = followed ? `${q} ${followed}` : q;   // "Is it on the 1260H list?" after "Who is ByteDance?" is about ByteDance
+    // What Aegis did this week (the dashboard's "Aegis's impact" numbers), for questions about what Aegis or Aegis One did.
+    if (deps.stats && IMPACT_Q.test(q)) facts = facts.concat(impactFact(await deps.stats()));
+    facts = facts.concat(listingFacts(subject, extraFacts));
+    // Other questions about those items get the same lists, so Gemma knows where each one came from.
+    const about = namedCompanies(q, atlas).length ? namedCompanies(q, atlas) : followed ? namedCompanies(followed, atlas) : [];
+    facts = facts.concat(dashboardFacts(q, ((data && data.sites) || []).filter(Boolean), !!((lists && lists.brokers) || (data && data.lists && data.lists.brokersAsOf)), about));
+    // "yes tell me more" after "Was LinkedIn hacked?" stays on LinkedIn (Gemma drifted to another site's breach).
+    const moreBreach = last && BREACH_Q.test(last.question) && !BREACH_Q.test(q) && (FOLLOW_UP.test(q) || MORE_Q.test(q)) ? breachSites(last.question, lists) : [];
+    const breachNames = and(moreBreach.map(([d, b]) => siteLabel(d, b).replace(/ \(.*$/, "")));
+    const extra = deps.facts ? await deps.facts() : FACT_FILES;
+    const trace = [{ tool: "get_site_report", label: "Your browsing" }];
+    try {
+      const context = buildContext(data, null, facts, extra, q, standalone ? [] : deps.history) +
+        (steps ? "" : `\n\nFor this question: Don't add a "What you can do" line; just answer it.`) +
+        (toC(q) ? TO_C_NOTE : "") +
+        (breachNames ? `\n\nFor this question: they want more about ${breachNames}'s breach record. Answer only about ${breachNames}, from its [HIBP] facts; don't bring up other sites' breaches.` : "");
+      // A source tag needs evidence behind it: Gemma wrote [HIBP] with no breach facts (2026-10-24), which also showed a
+      // "Have I Been Pwned" check mark Aegis never made. Tags that aren't in the evidence are removed, so their chips don't show.
+      const memo = new Map();
+      const sourcedOnly = (t) => dropFalseListings(dropUnknownNames(dropUnbackedBreaches(t, lists), context, atlas, memo), extra, subject).replace(/\s*\[([^\]]+)\]/g, (m, tag) => (TAGS.includes(tag) && !context.includes(`[${tag}]`) ? "" : m));
+      // While Aegis is writing, his words get the same clean-up as the finished answer (repeats, unsupported tags, steps),
+      // so nothing he showed is taken away at the end (Max, IDEA.md).
+      const writing = (so) => (echoesRules(so) ? "" : hideHalfRepeat(sourcedOnly(cleanAnswer(steps ? so : hideSteps(so)))));
+      const raw = await deps.ask(q, { system: SYSTEM_PROMPT, context, options: { temperature: 0.2, seed: SEED },
+                                      ...(deps.signal ? { signal: deps.signal } : {}),
+                                      ...(deps.onToken ? { onToken: (piece, so) => deps.onToken(piece, writing(so)) } : {}) });
+      const sourced = sourcedOnly(cleanAnswer(raw));
+      const text = steps ? sourced : dropSteps(sourced);
+      if (echoesRules(text)) return { answer: ECHO_ANSWER, trace: [] };
+      return { answer: text, trace: traceFor(text) };
+    } catch (e) {
+      return { error: e.message || "I couldn't reach Gemma. Is Ollama running?", trace };
+    }
+  }
+
+  (typeof window !== "undefined" ? window : self).AegisAskC = { answer, buildContext, cleanAnswer, lookupFacts, fixNames, SYSTEM_PROMPT, PURPOSE };
+})();

@@ -1,0 +1,51 @@
+// Aegis One impact + safety counters (shared/stats.js). Loaded by /background.js after tracking.js.
+// - Aegis's pop-ups and clicks arrive from content/c-events.js and are written in batches (one write per second at most).
+// - Today's numbers (grades, trackers, cookies, unsafe sites) are recomputed a few seconds after aegisData changes.
+(function () {
+  let pending = {};
+  let timer = null;
+  let chain = Promise.resolve();
+
+  function flushStats() {
+    clearTimeout(timer); timer = null;
+    const counts = pending; pending = {};
+    if (!Object.keys(counts).length) return chain;
+    chain = chain.then(async () => {
+      const r = await chrome.storage.local.get("aegisStats");
+      await chrome.storage.local.set({ aegisStats: AegisStats.addEvents(r.aegisStats, counts) });
+    }).catch(e => console.warn("Aegis One: could not save counters", e));
+    return chain;
+  }
+
+  function count(name) {
+    if (!AegisStats.EVENTS.includes(name)) return;
+    pending[name] = (pending[name] || 0) + 1;
+    if (!timer) timer = setTimeout(flushStats, 1000);
+  }
+
+  chrome.runtime.onMessage.addListener((msg) => {
+    if (msg && msg.type === "aegis-event") count(msg.event);
+  });
+
+  // Today's snapshot, from the same scored sites the popup and dashboard show.
+  let snapTimer = null;
+  function snapshotSoon() {
+    clearTimeout(snapTimer);
+    snapTimer = setTimeout(() => {
+      chain = chain.then(async () => {
+        if (typeof AegisData === "undefined" || !AegisData.load) return;
+        const data = await AegisData.load();
+        if (!data || data.sample) return;
+        const r = await chrome.storage.local.get("aegisStats");
+        await chrome.storage.local.set({ aegisStats: AegisStats.setSnapshot(r.aegisStats, AegisStats.snapshot(data.sites.filter((s) => !s.example))) });
+      }).catch(e => console.warn("Aegis One: could not save today's numbers", e));
+    }, 5000);
+  }
+  if (chrome.storage.onChanged) {
+    chrome.storage.onChanged.addListener((changes, area) => {
+      if (area === "local" && changes.aegisData && changes.aegisData.newValue) snapshotSoon();
+    });
+  }
+
+  self.flushStats = flushStats;
+})();

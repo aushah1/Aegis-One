@@ -1,0 +1,111 @@
+{
+  "manifest_version": 3,
+  "name": "Aegis One",
+  "version": "1.1.0",
+  "description": "Privacy monitoring and website health audits in one workspace. Local Gemma privacy assistance and optional audit service.",
+  "icons": {
+    "16": "icons/logo.png",
+    "32": "icons/logo.png",
+    "48": "icons/logo.png",
+    "128": "icons/logo.png"
+  },
+  "action": {
+    "default_title": "Aegis One",
+    "default_icon": {
+      "16": "icons/logo.png",
+      "32": "icons/logo.png"
+    }
+  },
+  "permissions": [
+    "storage",
+    "webRequest",
+    "webNavigation",
+    "alarms",
+    "cookies",
+    "scripting",
+    "offscreen",
+    "unlimitedStorage",
+    "browsingData"
+  ],
+  "content_scripts": [
+    {
+      "matches": [
+        "<all_urls>"
+      ],
+      "js": [
+        "content/regtrack-line.js",
+        "content/c-prompt.js",
+        "content/c-events.js",
+        "content/c-alert-look.js",
+        "content/c-placement.js",
+        "content/cookie-detector.js",
+        "content/alerts.js",
+        "content/panel.js",
+        "content/grade-chip.js",
+        "content/unsafe.js"
+      ],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": [
+        "<all_urls>"
+      ],
+      "js": [
+        "content/cookie-detector.js"
+      ],
+      "all_frames": true,
+      "run_at": "document_idle"
+    },
+    {
+      "matches": [
+        "<all_urls>"
+      ],
+      "js": [
+        "content/policy-link.js"
+      ],
+      "run_at": "document_end"
+    }
+  ],
+  "host_permissions": [
+    "http://*/*",
+    "https://*/*",
+    "http://localhost:4000/*",
+    "http://127.0.0.1:4000/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_security_policy": {
+    "extension_pages": "script-src 'self' 'wasm-unsafe-eval'; object-src 'self'"
+  },
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "shared/regtrack-facts.json"
+      ],
+      "matches": [
+        "<all_urls>"
+      ]
+    },
+    {
+      "resources": [
+        "icons/logo.svg",
+        "icons/logo.png"
+      ],
+      "matches": [
+        "http://*/*",
+        "https://*/*"
+      ]
+    },
+    {
+      "resources": [
+        "popup/popup.html"
+      ],
+      "matches": [
+        "http://*/*",
+        "https://*/*"
+      ],
+      "use_dynamic_url": true
+    }
+  ]
+}

@@ -1,0 +1,17 @@
+{
+  "name": "server",
+  "type": "module",
+  "scripts": {
+    "dev": "node --watch --env-file=../.env src/index.js",
+    "start": "node --env-file=../.env src/index.js"
+  },
+  "dependencies": {
+    "bullmq": "^5.0.0",
+    "cors": "^2.8.5",
+    "express": "^4.19.0",
+    "express-rate-limit": "^7.4.0",
+    "helmet": "^7.1.0",
+    "ioredis": "^5.4.0",
+    "mongoose": "^8.5.0"
+  }
+}

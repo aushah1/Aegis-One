@@ -1,0 +1,16 @@
+{
+  "name": "audit-tool",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "server",
+    "worker",
+    "client"
+  ],
+  "scripts": {
+    "dev": "concurrently -n server,worker,client -c blue,magenta,green \"npm run dev -w server\" \"npm run dev -w worker\" \"npm run dev -w client\""
+  },
+  "devDependencies": {
+    "concurrently": "^8.2.2"
+  }
+}

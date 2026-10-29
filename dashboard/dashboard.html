@@ -1,0 +1,321 @@
+<!doctype html>
+<html lang="en" data-theme="light" data-style="glass">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>Aegis One dashboard</title>
+  <link rel="stylesheet" href="../shared/theme.css">
+  <link rel="stylesheet" href="../shared/ui.css">
+  <link rel="stylesheet" href="dashboard.css">
+  <link rel="stylesheet" href="aegis.css">
+  <script src="../shared/settings.js"></script>
+  <script src="../shared/theme-boot.js"></script>
+</head>
+<body>
+  <div class="backdrop" aria-hidden="true"></div>
+
+  <header class="toolbar">
+    <div class="toolbar-inner glass" data-liquid="bar">
+      <span class="brand"><span id="wordmark"></span><span id="sample-note" class="sample-badge" title="Browse with Aegis One on and your own sites appear here." hidden>Sample data</span></span>
+      <nav class="segmented" id="tabs" role="tablist" aria-label="Dashboard sections">
+        <span class="seg-thumb" aria-hidden="true"></span>
+        <button role="tab" id="tab-overview" aria-controls="panel-overview" data-tab="overview">Overview</button>
+        <button role="tab" id="tab-sites" aria-controls="panel-sites" data-tab="sites">Sites</button>
+        <button role="tab" id="tab-impact" aria-controls="panel-impact" data-tab="impact">Aegis's impact</button>
+        <button role="tab" id="tab-safety" aria-controls="panel-safety" data-tab="safety">Safety</button>
+        <button role="tab" id="tab-ask" aria-controls="panel-ask" data-tab="ask">Ask Aegis</button>
+        <button role="tab" id="tab-grades" aria-controls="panel-grades" data-tab="grades">Grades</button>
+        <button role="tab" id="tab-audit" aria-controls="panel-audit" data-tab="audit">Website audit</button>
+        <button role="tab" id="tab-about" aria-controls="panel-about" data-tab="about">About</button>
+      </nav>
+      <button class="icon-btn" id="open-settings" aria-label="Settings" aria-haspopup="dialog" aria-controls="settings">
+        <svg viewBox="0 0 24 24" width="19" height="19" aria-hidden="true"><path fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" d="M12 15.2a3.2 3.2 0 1 0 0-6.4 3.2 3.2 0 0 0 0 6.4Z"/><path fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" d="M19.4 13.5a7.7 7.7 0 0 0 0-3l2-1.6-2-3.4-2.4 1a7.6 7.6 0 0 0-2.6-1.5L14 2.5h-4l-.4 2.5a7.6 7.6 0 0 0-2.6 1.5l-2.4-1-2 3.4 2 1.6a7.7 7.7 0 0 0 0 3l-2 1.6 2 3.4 2.4-1a7.6 7.6 0 0 0 2.6 1.5l.4 2.5h4l.4-2.5a7.6 7.6 0 0 0 2.6-1.5l2.4 1 2-3.4-2-1.6Z"/></svg>
+      </button>
+    </div>
+  </header>
+
+  <main class="page">
+    <!-- Overview -->
+    <section class="panel" id="panel-overview" role="tabpanel" aria-labelledby="tab-overview">
+      <div class="ov-grid">
+        <div class="hero glass" id="intro"></div>
+        <div class="card glass gauge-card" id="exposure"></div>
+        <div class="card glass facts-card" id="facts"></div>
+        <div class="card glass week-card" id="week"></div>
+        <div class="card glass" id="purposes"></div>
+        <div class="card glass" id="countries"></div>
+        <div class="card glass follow-card" id="follow"></div>
+      </div>
+    </section>
+
+
+    <section class="panel" id="panel-audit" role="tabpanel" aria-labelledby="tab-audit" hidden>
+      <div class="audit-hero"><div><span class="audit-eyebrow">AEGIS ONE / WEB INTELLIGENCE</span><h1>Know what your website is hiding.</h1><p>Inspect performance, accessibility, security headers, TLS and SEO from one workspace. The optional AI summary highlights practical fixes.</p></div><div class="audit-orb">◎</div></div>
+      <div class="audit-shell">
+        <form id="audit-form" class="audit-search"><label for="audit-url">Website URL</label><div class="audit-entry"><input id="audit-url" type="url" placeholder="https://example.com" required><button type="submit" id="audit-run">Run full audit →</button></div></form>
+        <div class="audit-note" id="audit-connection">Requires the included local audit service (localhost:4000). Nothing is sent until you run an audit.</div>
+        <div id="audit-status" role="status" aria-live="polite"></div>
+        <div id="audit-result" hidden></div>
+      </div>
+    </section>
+
+    <!-- Sites -->
+    <section class="panel" id="panel-sites" role="tabpanel" aria-labelledby="tab-sites" hidden>
+      <div class="panel-head">
+        <h1>Your sites</h1>
+        <p>Pick a site to see what raised or lowered its grade. Each site combines your visits from the last 7 days.</p>
+      </div>
+      <div class="split">
+        <div class="site-index glass"><div class="site-list" id="sites" role="listbox" aria-label="Your sites"></div></div>
+        <article class="site-detail glass" id="site-detail" aria-live="polite"></article>
+      </div>
+    </section>
+
+    <!-- Aegis's impact -->
+    <section class="panel" id="panel-impact" role="tabpanel" aria-labelledby="tab-impact" hidden>
+      <div class="panel-head with-range">
+        <div>
+          <h1>What Aegis did for you</h1>
+          <p>Every time Aegis stepped in on a website, and what you did next. Aegis One doesn't block anything; it warns you and helps you say no.</p>
+        </div>
+        <div class="range segmented small" data-range-for="impact" role="radiogroup" aria-label="Time range">
+          <span class="seg-thumb" aria-hidden="true"></span>
+          <button role="radio" data-range="day">Today</button>
+          <button role="radio" data-range="week">7 days</button>
+          <button role="radio" data-range="month">30 days</button>
+        </div>
+      </div>
+      <div id="impact"></div>
+    </section>
+
+    <!-- Safety over time -->
+    <section class="panel" id="panel-safety" role="tabpanel" aria-labelledby="tab-safety" hidden>
+      <div class="panel-head with-range">
+        <div>
+          <h1>Your safety over time</h1>
+          <p>How risky the sites you visited were, day by day. Aegis One keeps daily totals for 90 days, numbers only, no site names.</p>
+        </div>
+        <div class="range segmented small" data-range-for="safety" role="radiogroup" aria-label="Time range">
+          <span class="seg-thumb" aria-hidden="true"></span>
+          <button role="radio" data-range="day">Today</button>
+          <button role="radio" data-range="week">7 days</button>
+          <button role="radio" data-range="month">30 days</button>
+        </div>
+      </div>
+      <div id="safety"></div>
+      <div class="card glass safety-cookies" id="cookies-card"></div>
+    </section>
+
+    <!-- Ask Aegis -->
+    <section class="panel" id="panel-ask" role="tabpanel" aria-labelledby="ask-c-title" hidden>
+      <div class="chat glass" id="ask-c">
+        <div class="chat-head">
+          <div class="ask-face" id="ask-c-face" aria-hidden="true"></div>
+          <div>
+            <b id="ask-c-title">Ask Aegis</b>
+            <span>Gemma 4 runs right in your browser, on this computer. Your questions and browsing never leave it.</span>
+          </div>
+        </div>
+        <div class="ask-thread" id="ask-thread" aria-live="polite">
+          <p class="ask-empty" id="ask-empty"><strong>Ask about any company or site.</strong>Aegis checks tracker, data-broker, breach and research records on this computer and labels where each fact came from.</p>
+        </div>
+        <div class="chat-foot">
+          <div class="ask-suggest" id="ask-suggest"></div>
+          <form class="ask-form" id="ask-form">
+            <label class="visually-hidden" for="ask-input">Your question for Aegis</label>
+            <input id="ask-input" type="text" autocomplete="off" placeholder="Who is Criteo? Which sites shared the most?">
+            <button class="btn" id="ask-send" type="submit">Ask</button>
+          </form>
+        </div>
+      </div>
+    </section>
+
+    <!-- How grades work -->
+    <section class="panel" id="panel-grades" role="tabpanel" aria-labelledby="tab-grades" hidden>
+      <div class="panel-head grades-head">
+        <h1>How the grade works</h1>
+        <p class="lead">0&ndash;100 exposure score. Lower means less exposure.</p>
+        <p>Only what Aegis One observes or finds on record adds points; unknowns add 0. This is our rating, not the chance your data will be sold or breached.</p>
+      </div>
+      <div class="rubric">
+        <div class="card glass">
+          <table id="rubric">
+            <thead><tr><th>What goes into your score</th><th>Points</th></tr></thead>
+            <tbody>
+            <tr><td><b class="rule-title">Tracking companies</b><p>Each outside tracking company counts once, across all its web addresses, and must appear on at least half of your visits. Companies seen only after you accept cookies are listed separately.</p></td><td><b>5 each</b><small>Up to 40</small></td></tr>
+            <tr><td><b class="rule-title">Advertising, data brokering &amp; screen recording</b><p>Add points for each counted tracking company used for any of these.</p></td><td><b>5 each</b><small>Up to 20</small></td></tr>
+            <tr><td><b class="rule-title">Cookie choice</b><p><b>10:</b> accepted all, no Reject button, or tracking without a banner. <b>0:</b> declined, or no banner and no tracking.</p></td><td><b>10 or 0</b></td></tr>
+            <tr><td><b class="rule-title">Listed country or company ties</b><p>Added once if any apply (unknown outside servers are shown, 0 points):</p><ul><li>A company based in a listed foreign-adversary country (15 CFR 7.4) or on the Pentagon's 1260H list</li><li>The site's web address ends in one of those countries' codes (.cn, .ru ...), or its own server address is registered there</li><li>The site is state-run news from one of those countries</li></ul></td><td><b>15</b><small>Counted once</small></td></tr>
+            <tr><td><b class="rule-title">Privacy policy</b><p><b>15:</b> says it sells data. <b>8:</b> shares with partners. <b>0:</b> neither, not checked, or unclear.</p></td><td><b>15 / 8 / 0</b></td></tr>
+            <tr><td><b class="rule-title">Site's data breaches</b><p><b>15:</b> reported within 12 months. <b>5:</b> within 5 years, or 100 million+ accounts. <b>0:</b> older, smaller ones. All are listed; only the worst counts. Source: Have I Been Pwned.</p></td><td><b>15 / 5 / 0</b></td></tr>
+          </tbody>
+          </table>
+        </div>
+        <div class="card glass grades-key" id="grades-key"></div>
+      </div>
+      <div class="card glass how-calc">
+        <h2>How a grade is calculated</h2>
+        <ol>
+          <li><b>Look.</b> Aegis One records what your browser did on a site in the last 7 days (trackers, cookies, your cookie choice) and checks public lists (data breaches, data brokers, U.S. government lists) and, when it's been read, the site's privacy policy.</li>
+          <li><b>Add points.</b> Each rule in the table adds points for what was found. A company counts once, and only if it showed up on at least half of your visits, so reloading a page or a different ad winning the auction doesn't change the grade. Anything unknown adds 0.</li>
+          <li><b>Cap and letter.</b> The total is capped at 100 and turned into a letter with the key above.</li>
+          <li><b>Range.</b> Unknown lines set a range: the worst the score could be if they turned out badly. Today only the privacy policy can be unknown (up to 15 points).</li>
+          <li><b>Label.</b> <b>Fully checked</b> when every line has an answer, <b>Partly checked</b> when something is unknown, with the share of the grade's 115 possible points that has an answer. While Aegis is reading a site's privacy policy, it says <b>Reading the privacy policy</b> instead.</li>
+        </ol>
+        <p class="hint">Each site's own numbers are under "How this grade was calculated" on the Sites tab. Fully checked doesn't mean safe: what companies do with data on their own servers stays unknown.</p>
+      </div>
+      <div class="evidence">
+        <div class="glass"><h3>Observed</h3><p>Connections your browser actually made while you were on a site. Aegis One sees these directly.</p></div>
+        <div class="glass"><h3>Disclosed</h3><p>What a company says in its own privacy policy, like whether it sells or shares your information.</p></div>
+        <div class="glass"><h3>Unknown</h3><p>What happens after data reaches a company's servers. Companies can pass it along server to server, out of any browser's view.</p></div>
+      </div>
+      <p class="fine">Foreign-adversary countries follow the U.S. Commerce Department list in 15 CFR § 7.4. A flag means a tracker belongs to a company based there, not that your data was sent to a government.</p>
+      <footer class="foot">
+        <p><b>Your browsing and your questions to Aegis stay on this computer.</b> Aegis One never sends anything about what you visit. Its tracker list is built in; it downloads only whole public lists (data breaches, data brokers) that are the same for everyone, Aegis's AI model only when you click Download Aegis's brain, and, when policy reading is on, a site's own privacy policy page from that same site, without your cookies. It saves site names and cookie names only (never full web addresses or what's inside a cookie), and deletes history older than 7 days on its own. Daily totals (numbers only, no site names) are kept for 90 days so you can see your week and month.</p>
+        <p class="sources">Sources: tracker data from <a href="https://github.com/duckduckgo/tracker-radar" target="_blank" rel="noopener">DuckDuckGo Tracker Radar</a> (CC BY-NC-SA 4.0) · breach data from <a href="https://haveibeenpwned.com" target="_blank" rel="noopener">Have I Been Pwned</a> (CC BY 4.0) · data broker list from the <a href="https://cppa.ca.gov/data_broker_registry/" target="_blank" rel="noopener">California Privacy Protection Agency</a> · cookie purposes from the <a href="https://github.com/jkwakman/Open-Cookie-Database" target="_blank" rel="noopener">Open Cookie Database</a> (Apache 2.0) · AI: Gemma 4 running in your browser with <a href="https://ai.google.dev/edge/litert-lm" target="_blank" rel="noopener">LiteRT-LM</a> (Apache 2.0), or locally with Ollama.</p>
+      </footer>
+    </section>
+
+    <!-- About: what's new in Aegis One, for Gator Hack V judges ("Fresh off the frontier") -->
+    <section class="panel" id="panel-about" role="tabpanel" aria-labelledby="tab-about" hidden>
+      <div class="panel-head">
+        <h1>Built on what's new</h1>
+        <p>Aegis One was built at Gator Hack V (October 23-25, 2026) for the "Fresh off the frontier" challenge. Everything in this first list was first made public in the 12 months before the hackathon, and each one does real work in Aegis One.</p>
+      </div>
+      <ol class="about-list">
+        <li class="card glass" data-released="2026-03-31">
+          <h3>Gemma 4 <span>Google, March 31, 2026</span></h3>
+          <p>Aegis's brain. Ask Aegis answers your questions from what Aegis One saw, with a source tag on every fact, and reads privacy policies for "sells" and "shares", quoting the exact sentence. It runs on your own computer, so your browsing never leaves it.</p>
+          <p class="where">In <code>shared/askc.js</code>, <code>shared/policy.js</code>, <code>shared/gemma.js</code> · <a href="https://ai.google.dev/gemma/docs/releases" target="_blank" rel="noopener">Gemma releases</a></p>
+        </li>
+        <li class="card glass" data-released="2026-05-18">
+          <h3>LiteRT-LM for the web <span>Google, first released May 18, 2026</span></h3>
+          <p>Runs Gemma 4 inside Chrome on the graphics chip (WebGPU), so the in-browser version of Aegis One needs no other app: first words in about a second.</p>
+          <p class="where">In <code>vendor/litert-lm/</code>, <code>offscreen/brain.js</code> (in-browser version) · <a href="https://ai.google.dev/edge/litert-lm/js" target="_blank" rel="noopener">LiteRT-LM docs</a></p>
+        </li>
+        <li class="card glass" data-released="2026-02-23">
+          <h3>RegTrack study <span>University of British Columbia, NDSS MADWeb, February 2026</span></h3>
+          <p>Measured 743 websites from 8 locations: accepting all cookies raised tracking from 48.5 to 56.2 domains per site from Ohio. Aegis quotes it, with page numbers, when cookies come up.</p>
+          <p class="where">In <code>shared/regtrack-facts.json</code>, <code>content/regtrack-line.js</code> · <a href="https://www.ndss-symposium.org/wp-content/uploads/madweb2026-10.pdf" target="_blank" rel="noopener">Paper</a></p>
+        </li>
+        <li class="card glass" data-released="2026-06-08">
+          <h3>Pentagon Section 1260H list <span>U.S. Department of War, June 8, 2026</span></h3>
+          <p>The update that first lists Alibaba and Baidu as Chinese military companies. Aegis names the company, the list and its date when a page loads one of their services.</p>
+          <p class="where">In <code>shared/flagged-companies.json</code>, <code>background/alerts.js</code> · <a href="https://www.federalregister.gov/documents/2026/06/10/2026-11571/notice-of-availability-of-designation-of-chinese-military-companies" target="_blank" rel="noopener">Federal Register</a></p>
+        </li>
+        <li class="card glass" data-released="2026-01-31">
+          <h3>California Data Broker Registry 2026 <span>California Privacy Protection Agency, 2026 registrations</span></h3>
+          <p>603 companies that buy and sell personal information. Downloaded whole every day; trackers owned by a registered broker are marked and count in the grade.</p>
+          <p class="where">In <code>shared/lists.js</code> · <a href="https://cppa.ca.gov/data_broker_registry/" target="_blank" rel="noopener">CPPA registry</a></p>
+        </li>
+      </ol>
+      <div class="card glass about-older">
+        <h3>Also used (older, kept up to date)</h3>
+        <p>DuckDuckGo Tracker Radar (which company owns each tracker), the Open Cookie Database (what each cookie is for), Have I Been Pwned (data breaches, downloaded daily), State Media Monitor (state-run news outlets, profiles updated 2026), the U.S. foreign-adversary country list (15 CFR 7.4) and the internet registries' address lists.</p>
+      </div>
+    </section>
+  </main>
+
+  <!-- Settings -->
+  <div class="sheet-scrim" id="settings-scrim" hidden></div>
+  <aside class="sheet glass" data-liquid="sheet" id="settings" role="dialog" aria-modal="true" aria-labelledby="settings-title" hidden>
+    <div class="sheet-body">
+    <div class="sheet-head">
+      <h2 id="settings-title">Settings</h2>
+      <button class="icon-btn" id="close-settings" aria-label="Close settings">
+        <svg viewBox="0 0 24 24" width="15" height="15" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+      </button>
+    </div>
+
+    <h3 class="group-title">Appearance</h3>
+    <div class="group">
+      <div class="row">
+        <span>Mode</span>
+        <div class="segmented small" data-setting="appearance" role="radiogroup" aria-label="Mode">
+          <span class="seg-thumb" aria-hidden="true"></span>
+          <button role="radio" data-value="system">Auto</button>
+          <button role="radio" data-value="light">Light</button>
+          <button role="radio" data-value="dark">Dark</button>
+        </div>
+      </div>
+      <div class="row">
+        <span>Style</span>
+        <div class="segmented small" data-setting="style" role="radiogroup" aria-label="Style">
+          <span class="seg-thumb" aria-hidden="true"></span>
+          <button role="radio" data-value="glass">Liquid glass</button>
+          <button role="radio" data-value="clean">Clean</button>
+        </div>
+      </div>
+      <div class="row tint-row">
+        <span>Glass color<small class="tint-note">Shows with Liquid glass</small></span>
+        <div class="swatches" data-setting="tint" role="radiogroup" aria-label="Glass color">
+          <button role="radio" data-value="aurora" class="swatch swatch-aurora" title="Aurora" aria-label="Aurora"></button>
+          <button role="radio" data-value="ocean" class="swatch swatch-ocean" title="Ocean" aria-label="Ocean"></button>
+          <button role="radio" data-value="forest" class="swatch swatch-forest" title="Forest" aria-label="Forest"></button>
+          <button role="radio" data-value="sunset" class="swatch swatch-sunset" title="Sunset" aria-label="Sunset"></button>
+          <button role="radio" data-value="rose" class="swatch swatch-rose" title="Rose" aria-label="Rose"></button>
+          <button role="radio" data-value="graphite" class="swatch swatch-graphite" title="Graphite" aria-label="Graphite"></button>
+        </div>
+      </div>
+      <div class="row">
+        <span>Toolbar pop-up</span>
+        <div class="segmented small" data-setting="toolbar" role="radiogroup" aria-label="Toolbar pop-up">
+          <span class="seg-thumb" aria-hidden="true"></span>
+          <button role="radio" data-value="panel">Rounded</button>
+          <button role="radio" data-value="window">Chrome's</button>
+        </div>
+      </div>
+    </div>
+    <p class="group-note">Auto follows your computer's light and dark mode. Glass color changes the colors you see through Liquid glass. Rounded floats Aegis One over the website when you click its toolbar button; Chrome's own pages always use Chrome's pop-up.</p>
+
+    <h3 class="group-title">Aegis on websites</h3>
+    <div class="group">
+      <label class="row"><span>Protect me automatically<small>Aegis declines extra cookies on every site with a Reject button, no click needed</small></span><input type="checkbox" class="switch" data-setting-bool="autoDecline"></label>
+      <label class="row"><span>Show the grade box<small>Top right when a site opens (once a day), and after you choose on a cookie banner</small></span><input type="checkbox" class="switch" data-setting-bool="gradeChip"></label>
+      <label class="row"><span>Offer to decline cookies<small>When a banner has a Reject button</small></span><input type="checkbox" class="switch" data-popup="cookie"></label>
+      <label class="row"><span>Warn about banners with no Reject<small>"Beware" when a banner only has Accept</small></span><input type="checkbox" class="switch" data-popup="acceptOnly"></label>
+      <label class="row"><span>Foreign-adversary alerts<small>When a page connects to a company in a listed country</small></span><input type="checkbox" class="switch" data-popup="adversary"></label>
+      <label class="row"><span>Unsafe-site warnings<small>Grade F plus a listed company or a breach in the last year: Go back or Continue anyway</small></span><input type="checkbox" class="switch" data-popup="unsafe"></label>
+      <a class="row link" href="../preview/c-variations.html" target="_blank" rel="noopener"><span>See Aegis on 17 kinds of cookie pop-ups<small>Test pages shaped like real sites' pop-ups</small></span><span class="chev" aria-hidden="true"></span></a>
+    </div>
+    <p class="group-note">A pop-up you turn off stays off on every site. Aegis One still grades the site.</p>
+
+    <h3 class="group-title">On this computer</h3>
+    <div class="group">
+      <label class="row"><span>Read privacy policies with Gemma<small>Checks whether a site says it sells or shares your data</small></span><input type="checkbox" class="switch" data-setting-bool="policyReader"></label>
+    </div>
+
+    <h3 class="group-title">Your data</h3>
+    <div class="group">
+      <label class="row"><span>Show example data<small>Adds example sites and a month of example totals, for demos. Your own data stays as it is</small></span><input type="checkbox" class="switch" data-setting-bool="exampleData"></label>
+      <a class="row link" id="open-welcome" href="../welcome/welcome.html" target="_blank" rel="noopener" hidden><span>Open the "Hi, I'm Aegis" page<small>The page Aegis One shows once when it's installed, for demo videos</small></span><span class="chev" aria-hidden="true"></span></a>
+      <button class="row destructive" id="clear" type="button">Clear my Aegis One data</button>
+    </div>
+    <p class="group-note">Site history is deleted after 7 days on its own. Daily totals (numbers only) are kept for 90 days. Settings stay.</p>
+    </div>
+  </aside>
+
+  <div class="chart-tip" id="chart-tip" role="tooltip" hidden></div>
+
+  <script src="../shared/logo.js"></script>
+  <script src="../shared/lists.js"></script>
+  <script src="../shared/cookies.js"></script>
+  <script src="../shared/example-data.js"></script>
+  <script src="../shared/data.js"></script>
+  <script src="../shared/stats.js"></script>
+  <script src="../shared/highlights.js"></script>
+  <script src="../shared/site-summary.js"></script>
+  <script src="../shared/icons.js"></script>
+  <script src="../shared/liquid-glass.js"></script>
+  <script src="explain.js"></script>
+  <script src="dashboard.js"></script>
+  <script src="activity.js"></script>
+  <script src="overview.js"></script>
+  <script src="tab-icons.js"></script>
+  <script src="tabs.js"></script>
+  <script src="ask-c.js"></script>
+  <script src="brain-card.js"></script>
+  <script src="audit.js"></script>
+</body>
+</html>

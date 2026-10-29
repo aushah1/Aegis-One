@@ -1,0 +1,447 @@
+// Aegis One tracker recorder (by Matthew). Loaded by /background.js.
+// Tracker list: shared/atlas.json (3,700+ domains from DuckDuckGo Tracker Radar, built by scripts/build-atlas.js).
+// TRACKERS below is only a fallback if the Atlas can't load.
+const RETENTION_DAYS = 7; // visit history older than this is deleted automatically
+
+const TRACKERS = [
+  { domain: "doubleclick.net", company: "Google", category: "Advertising", country: "US" },
+  { domain: "google-analytics.com", company: "Google", category: "Analytics", country: "US" },
+  { domain: "googletagmanager.com", company: "Google", category: "Analytics", country: "US" },
+  { domain: "connect.facebook.net", company: "Meta", category: "Advertising", country: "US" },
+  { domain: "facebook.net", company: "Meta", category: "Advertising", country: "US" },
+  { domain: "amazon-adsystem.com", company: "Amazon", category: "Advertising", country: "US" },
+  { domain: "criteo.com", company: "Criteo", category: "Advertising", country: "FR" },
+  { domain: "scorecardresearch.com", company: "Comscore", category: "Analytics", country: "US" },
+  { domain: "hotjar.com", company: "Hotjar", category: "Session recording", country: "MT" },
+  { domain: "rlcdn.com", company: "LiveRamp", category: "Data broker", country: "US" },
+  { domain: "ct.pinterest.com", company: "Pinterest", category: "Advertising", country: "US" },
+  { domain: "mc.yandex.ru", company: "Yandex", category: "Analytics", country: "RU" },
+  { domain: "hm.baidu.com", company: "Baidu", category: "Analytics", country: "CN" }
+];
+
+const tabSites = new Map(); // tabId -> site being visited (rebuilt as you browse)
+
+let ATLAS = null, COOKIE_DB = null;
+let OWNER_OF = {};          // "yandex.ru" -> "Yandex" (from Tracker Radar entities)
+let COUNTRY_OF = {};        // "Yandex" -> "RU" (from atlas.json)
+function setAtlas(a) {
+  ATLAS = a;
+  OWNER_OF = {}; COUNTRY_OF = {};
+  for (const [co, props] of Object.entries(a.entities || {})) for (const d of props) if (!OWNER_OF[d]) OWNER_OF[d] = co;
+  for (const v of Object.values(a.domains || {})) if (v[2] && !COUNTRY_OF[v[0]]) COUNTRY_OF[v[0]] = v[2];
+}
+function setCookieDb(d) { COOKIE_DB = d; }
+let STATE_MEDIA = null;     // shared/state-media.json (F2: state-run news sites)
+function setStateMedia(list) { STATE_MEDIA = list; }
+
+// The Atlas loads a moment after Chrome wakes the background script. Requests that arrive
+// before that wait for it, so they're never judged with the short fallback list.
+let atlasReady = Promise.resolve();
+if (typeof chrome !== "undefined" && chrome.runtime && chrome.runtime.getURL) {
+  atlasReady = fetch(chrome.runtime.getURL("shared/atlas.json")).then(r => r.json()).then(setAtlas)
+    .catch(e => console.warn("Aegis One: atlas.json didn't load, using the short fallback list", e));
+  fetch(chrome.runtime.getURL("shared/cookie-db.json")).then(r => r.json()).then(setCookieDb)
+    .catch(e => console.warn("Aegis One: cookie-db.json didn't load", e));
+  fetch(chrome.runtime.getURL("shared/state-media.json")).then(r => r.json()).then(setStateMedia)
+    .catch(e => console.warn("Aegis One: state-media.json didn't load", e));
+}
+
+// "a.b.example.com" -> ["a.b.example.com", "b.example.com", "example.com"]
+function suffixes(hostname) {
+  const parts = hostname.split(".");
+  const out = [];
+  for (let i = 0; i < parts.length - 1; i++) out.push(parts.slice(i).join("."));
+  return out;
+}
+
+function matchingTracker(hostname) {
+  if (ATLAS) {
+    for (const d of suffixes(hostname)) {
+      const hit = ATLAS.domains[d];
+      if (hit) return { domain: d, company: hit[0], category: hit[1], country: hit[2], fingerprinting: hit[4] || 0 };
+    }
+    return null;
+  }
+  return TRACKERS.find(t =>
+    hostname === t.domain || hostname.endsWith("." + t.domain)
+  );
+}
+
+// Site roots worth comparing: "news.bbc.co.uk" -> ["news.bbc.co.uk", "bbc.co.uk"] (never "co.uk" or "com").
+function siteRoots(domain) {
+  return suffixes(domain).filter(r => {
+    const p = r.split(".");
+    if (p.length < 2) return false;
+    if (p.length === 2 && /^(co|com|org|net|ac|gov|edu)$/.test(p[0]) && p[1].length === 2) return false;
+    return true;
+  });
+}
+
+// True when the request goes to the site itself or to the company that owns the site
+// (google.com loading doubleclick.net is Google talking to Google, not a third party).
+function isFirstParty(siteDomain, hostname, tracker) {
+  const roots = siteRoots(siteDomain);
+  if (roots.some(r => hostname === r || hostname.endsWith("." + r))) return true;
+  const owned = ATLAS && tracker && ATLAS.entities[tracker.company];
+  if (owned && roots.some(r => owned.includes(r))) return true;
+  // The same state-run outlet's other addresses (tass.com loading tass.ru) are the site itself (F2 list).
+  if (typeof AegisStateMedia !== "undefined" && STATE_MEDIA) {
+    const a = AegisStateMedia.lookup(siteDomain, STATE_MEDIA), b = a && AegisStateMedia.lookup(hostname, STATE_MEDIA);
+    if (b && a.stateMedia.name === b.stateMedia.name) return true;
+  }
+  return false;
+}
+
+// Which company owns this site, and where it's based (when known).
+function ownerOf(siteDomain) {
+  // A state-run outlet (F2) is the most specific answer, so it comes first.
+  const sm = typeof AegisStateMedia !== "undefined" && AegisStateMedia.lookup(siteDomain, STATE_MEDIA);
+  if (sm) return sm;
+  for (const r of siteRoots(siteDomain)) {
+    const co = OWNER_OF[r];
+    if (co) return { company: co, country: COUNTRY_OF[co] || null };
+  }
+  return null;
+}
+
+// Only real web pages count as visits (not the new-tab page, settings, or extension pages).
+function cleanDomain(url) {
+  try {
+    const u = new URL(url);
+    if (u.protocol !== "http:" && u.protocol !== "https:") return null;
+    if (!u.hostname.includes(".")) return null; // localhost, intranet names
+    return u.hostname.replace(/^www\./, "");
+  } catch {
+    return null;
+  }
+}
+
+function isFresh(site, now = Date.now()) {
+  return !site.lastVisit || now - Date.parse(site.lastVisit) < RETENTION_DAYS * 86400000;
+}
+
+// Save one site into aegisData, keeping other sites (history) and anything
+// another part of Aegis One already learned (cookie choice, policy answers).
+// Speed: sites waiting to be saved are written together, so a page that loads 30 trackers at once
+// costs one storage read + write instead of 30.
+let saveChain = Promise.resolve();
+const unsaved = new Set();
+let saveQueued = false;
+function saveSite(site) {
+  unsaved.add(site);
+  if (saveQueued) return saveChain;
+  saveQueued = true;
+  saveChain = saveChain.then(async () => {
+    saveQueued = false;
+    const batch = [...unsaved];
+    unsaved.clear();
+    const res = await chrome.storage.local.get("aegisData");
+    const data = (res.aegisData && Array.isArray(res.aegisData.sites)) ? res.aegisData : { sites: [] };
+    data.sample = false;
+    data.sites = data.sites.filter(s => isFresh(s));   // auto-delete old history
+    for (const site of batch) mergeSite(data, site);
+    await chrome.storage.local.set({ aegisData: data });
+  }).catch(e => { saveQueued = false; console.warn("Aegis One: could not save site", e); });
+  return saveChain;
+}
+
+// Delete history older than RETENTION_DAYS without waiting for the next visit: when the background
+// script starts (Chrome opens, or it wakes up) and once a day.
+function pruneOldSites() {
+  saveChain = saveChain.then(async () => {
+    const res = await chrome.storage.local.get("aegisData");
+    const data = res.aegisData;
+    if (!data || !Array.isArray(data.sites)) return;
+    const kept = data.sites.filter(s => isFresh(s));
+    if (kept.length === data.sites.length) return;
+    data.sites = kept;
+    await chrome.storage.local.set({ aegisData: data });
+  }).catch(e => console.warn("Aegis One: could not delete old history", e));
+  return saveChain;
+}
+pruneOldSites();
+if (chrome.runtime && chrome.runtime.onStartup) chrome.runtime.onStartup.addListener(pruneOldSites);
+if (chrome.alarms) {
+  chrome.alarms.create("aegis-prune", { periodInMinutes: 24 * 60 });
+  chrome.alarms.onAlarm.addListener(a => { if (a && a.name === "aegis-prune") pruneOldSites(); });
+}
+
+// One page load is one visit. Count it once on the site's record, and each company once per visit
+// (shared/data.js only gives points to companies seen on at least half of a site's visits).
+function countVisit(rec, site) {
+  if (!site.visitId) return;
+  if (rec.lastVisitId !== site.visitId) { rec.visits = (rec.visits || 0) + 1; rec.lastVisitId = site.visitId; }
+  rec.companyVisits = rec.companyVisits || {};
+  for (const t of site.trackers || []) {
+    const co = t.company || t.domain;
+    const c = rec.companyVisits[co] || (rec.companyVisits[co] = { n: 0, last: null });
+    if (c.last !== site.visitId) { c.n++; c.last = site.visitId; }
+  }
+}
+
+function mergeSite(data, site) {
+    const i = data.sites.findIndex(s => s.domain === site.domain);
+    if (i === -1) { const rec = { ...site, trackers: [...site.trackers] }; countVisit(rec, site); data.sites.push(rec); }
+    else {
+      const old = data.sites[i];
+      const trackers = [...old.trackers || []];
+      for (const t of site.trackers) {
+        const had = trackers.find(x => x.domain === t.domain);
+        if (!had) trackers.push(t);
+        else if (had.afterAccept && !t.afterAccept) delete had.afterAccept;   // also loads without Accept
+      }
+      data.sites[i] = {
+        ...old,
+        lastVisit: site.lastVisit,
+        trackers,
+        cookieChoice: old.cookieChoice && old.cookieChoice !== "none" ? old.cookieChoice : site.cookieChoice,
+        cookies: old.cookies || site.cookies,
+        owner: site.owner || old.owner || null,
+        foreignHosts: [...new Set([...(old.foreignHosts || []), ...(site.foreignHosts || [])])],
+        server: site.server || old.server || null,
+        foreignServers: [...(old.foreignServers || []), ...(site.foreignServers || []).filter(x => !(old.foreignServers || []).some(o => o.host === x.host))],
+        policy: old.policy && old.policy.source ? old.policy : site.policy
+      };
+      countVisit(data.sites[i], site);
+    }
+}
+
+// Cookie inventory: list the cookies the site and its trackers keep in this browser.
+// Only name, owner domain and lifetime are kept; values are dropped right here and never stored.
+async function inventoryCookies(domain) {
+  if (!(chrome.cookies && chrome.cookies.getAll) || typeof AegisCookies === "undefined") return;
+  const site = [...tabSites.values()].find(s => s.domain === domain);
+  const roots = siteRoots(domain);
+  const lookIn = new Set([roots[roots.length - 1] || domain, ...((site && site.trackers) || []).map(t => t.domain)]);
+  const found = new Map();
+  for (const d of lookIn) {
+    let list = [];
+    try { list = await chrome.cookies.getAll({ domain: d }); } catch (e) { continue; }
+    for (const c of list) {
+      const item = AegisCookies.describe(c, domain, COOKIE_DB);
+      found.set(item.name + "@" + item.domain, item);
+    }
+  }
+  const cookies = [...found.values()].slice(0, 80);
+  saveChain = saveChain.then(async () => {
+    const res = await chrome.storage.local.get("aegisData");
+    const s = res.aegisData && Array.isArray(res.aegisData.sites) && res.aegisData.sites.find(x => x.domain === domain);
+    if (!s) return;
+    s.cookies = cookies;
+    await chrome.storage.local.set({ aegisData: res.aegisData });
+  }).catch(e => console.warn("Aegis One: could not save cookies", e));
+  return saveChain;
+}
+
+if (chrome.webNavigation.onCompleted) {
+  chrome.webNavigation.onCompleted.addListener(details => {
+    if (details.frameId !== 0) return;
+    const domain = cleanDomain(details.url);
+    if (!domain) return;
+    // Trackers set cookies a few seconds after the page loads, so look twice.
+    setTimeout(() => inventoryCookies(domain), 4000);
+    setTimeout(() => inventoryCookies(domain), 15000);
+  });
+}
+
+// Cookie choices reported by content/cookie-detector.js.
+// A real choice (declined / accepted) beats "no-reject"; nothing beats a real choice except a newer one.
+function updateCookieChoice(domain, choice) {
+  if (!["declined", "accepted", "no-reject"].includes(choice)) return Promise.resolve();
+  saveChain = saveChain.then(async () => {
+    const res = await chrome.storage.local.get("aegisData");
+    const data = res.aegisData;
+    const site = data && Array.isArray(data.sites) && data.sites.find(s => s.domain === domain);
+    if (!site) return;
+    if (choice === "no-reject" && (site.cookieChoice === "declined" || site.cookieChoice === "accepted")) return;
+    site.cookieChoice = choice;
+    for (const s of tabSites.values()) if (s.domain === domain) s.cookieChoice = choice;
+    await chrome.storage.local.set({ aegisData: data });
+  }).catch(e => console.warn("Aegis One: could not save cookie choice", e));
+  return saveChain;
+}
+
+// Chrome pauses the background script when idle and forgets tabSites. Keep a copy in
+// session storage (cleared when Chrome closes) and restore it when the script wakes up.
+let tabsReady = Promise.resolve();
+if (chrome.storage.session) {
+  tabsReady = chrome.storage.session.get("aegisTabs").then(r => {
+    for (const [id, site] of Object.entries((r && r.aegisTabs) || {})) if (!tabSites.has(Number(id))) tabSites.set(Number(id), site);
+  }).catch(() => {});
+}
+let tabsTimer = null;
+function rememberTabs() {
+  if (!chrome.storage.session) return;
+  clearTimeout(tabsTimer);
+  tabsTimer = setTimeout(() => chrome.storage.session.set({ aegisTabs: Object.fromEntries(tabSites) }).catch(() => {}), 300);
+}
+
+// Background preloads (Google prerenders search results) are not visits.
+function isBackgroundPage(details) {
+  return details.documentLifecycle && details.documentLifecycle !== "active";
+}
+
+// Start a fresh record when a tab navigates to a new website.
+chrome.webNavigation.onCommitted.addListener(details => {
+  if (details.frameId !== 0 || isBackgroundPage(details)) return;
+  const domain = cleanDomain(details.url);
+  if (domain) startSite(details.tabId, domain);
+});
+
+let visitCount = 0;
+function startSite(tabId, domain) {
+  const site = {
+    domain,
+    visitId: `${Date.now().toString(36)}-${tabId}-${++visitCount}`,
+    lastVisit: new Date().toISOString(),
+    cookieChoice: "none",
+    policy: { sells: null, shares: null, source: null },
+    trackers: []
+  };
+  site.server = serverFor(tabId, domain);
+  tabSites.set(tabId, site);
+  rememberTabs();
+  atlasReady.then(() => {
+    site.owner = ownerOf(domain);
+    saveSite(site);
+    if (typeof AegisAlerts !== "undefined") AegisAlerts.check(tabId, site);
+  });
+  return site;
+}
+
+// Pages already open when Aegis One starts (right after the extension is reloaded or updated) never send
+// onCommitted, so they were missed and the popup fell back to sample data. Record them now; anything
+// they load from here on counts. (Tabs Aegis One already knew about are left as they are.)
+if (chrome.tabs && chrome.tabs.query) {
+  Promise.all([atlasReady, tabsReady]).then(() => chrome.tabs.query({})).then(tabs => {
+    for (const tab of tabs || []) {
+      const domain = tab.url && cleanDomain(tab.url);
+      const known = tabSites.get(tab.id);
+      if (domain && !(known && known.domain === domain)) startSite(tab.id, domain);
+    }
+  }).catch(() => {});
+}
+
+// The popup asks which site a tab is on (Chrome can hide a tab's address from the popup). Chrome's webNavigation
+// says what the tab shows right now, even one of Chrome's own pages (the new-tab page), which sends extensions no
+// navigation event: so the website the tab showed before is never passed off as the current one.
+if (chrome.runtime && chrome.runtime.onMessage) {
+  chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+    if (!msg || msg.type !== "aegis-tab-site" || !fromAegisPage(sender)) return;   // Aegis One's popup only
+    const known = tabSites.get(msg.tabId);
+    const recorded = { domain: known ? known.domain : null };
+    if (!chrome.webNavigation.getFrame) { sendResponse(recorded); return; }
+    chrome.webNavigation.getFrame({ tabId: msg.tabId, frameId: 0 })
+      .then((frame) => sendResponse(frame && frame.url ? { domain: cleanDomain(frame.url) } : recorded))
+      .catch(() => sendResponse(recorded));
+    return true;   // answers once Chrome replies
+  });
+}
+
+function isPreload(details) {
+  return details.type === "main_frame" || details.type === "other";
+}
+
+function handleRequest(details, site) {
+  // A whole-page load is never a tracker on the page you're on, and neither is a pre-load. Google's results page
+  // pre-loads ("prefetches") result and ad pages in the same tab (aliexpress.com, taobao.com); Chrome reports
+  // those as "main_frame" or "other". They were wrongly counted as google.com trackers.
+  if (isPreload(details)) return;
+  const hostname = cleanDomain(details.url);
+  if (!hostname) return;
+
+  const tracker = matchingTracker(hostname);
+  if (!tracker) return rememberForeignHost(site, hostname);
+
+  // Don't count a site's own requests (or its owner's) as third-party tracking.
+  if (isFirstParty(site.domain, hostname, tracker)) return;
+
+  if (!site.trackers.some(t => t.domain === tracker.domain)) {
+    // First seen on this visit after you clicked Accept: listed on the grade, but adds no tracker points (shared/data.js).
+    site.trackers.push(site.cookieChoice === "accepted" ? { ...tracker, afterAccept: true } : tracker);
+    site.lastVisit = new Date().toISOString();
+    rememberTabs();
+    saveSite(site);
+    if (typeof AegisAlerts !== "undefined") AegisAlerts.check(details.tabId, site);
+  }
+}
+
+// F1: an outside server not in the Atlas whose address ends in a listed country's code (cip.cu, tns-counter.ru).
+// Only its main name is kept (never the full address); it's shown on the grade with 0 points.
+function rememberForeignHost(site, hostname) {
+  if (typeof AegisData === "undefined" || !AegisData.countryOfAddress(hostname)) return;
+  if (isFirstParty(site.domain, hostname, null)) return;
+  const roots = siteRoots(hostname);
+  const name = roots[roots.length - 1] || hostname;
+  site.foreignHosts = site.foreignHosts || [];
+  if (site.foreignHosts.includes(name) || site.foreignHosts.length >= 20) return;
+  site.foreignHosts.push(name);
+  rememberTabs();
+  saveSite(site);
+}
+
+// Detect requests to known tracking domains.
+chrome.webRequest.onBeforeRequest.addListener(
+  details => {
+    if (details.tabId < 0 || isBackgroundPage(details)) return;
+    const site = tabSites.get(details.tabId);
+    if (site && ATLAS) return handleRequest(details, site);
+    // Not ready yet (just woke up): wait for the Atlas and the restored tabs, then judge it.
+    Promise.all([atlasReady, tabsReady]).then(() => {
+      const s = site || tabSites.get(details.tabId);
+      if (s) handleRequest(details, s);
+    });
+  },
+  { urls: ["<all_urls>"] }
+);
+
+// F3: server location. Chrome reports each response's IP address; shared/ipgeo.js says whether it's registered
+// in one of the 7 listed countries. Only the country (and an outside server's main name) is kept, never the address.
+const mainServer = new Map();   // tabId -> { domain, country } of the page's own server (arrives before onCommitted)
+function serverFor(tabId, domain) {
+  const main = mainServer.get(tabId);
+  return main && main.domain === domain && main.country ? { country: main.country } : null;
+}
+function handleResponse(details) {
+  if (details.tabId < 0 || !details.ip || typeof AegisIP === "undefined") return;
+  const hostname = cleanDomain(details.url);
+  if (!hostname) return;
+  const country = AegisIP.countryOfIp(details.ip);
+  const site = tabSites.get(details.tabId);
+  if (details.type === "other") return;   // pre-loads (see isPreload)
+  if (details.type === "main_frame") {
+    mainServer.set(details.tabId, { domain: hostname, country });
+    // The page was already committed (this response was waiting for the lists to load): fill it in now.
+    if (site && site.domain === hostname && country && !site.server) { site.server = { country }; rememberTabs(); saveSite(site); }
+    return;
+  }
+  if (!country || !site || isFirstParty(site.domain, hostname, matchingTracker(hostname))) return;
+  const roots = siteRoots(hostname);
+  const host = roots[roots.length - 1] || hostname;
+  site.foreignServers = site.foreignServers || [];
+  if (site.foreignServers.some(x => x.host === host) || site.foreignServers.length >= 20) return;
+  site.foreignServers.push({ host, country });
+  rememberTabs();
+  saveSite(site);
+}
+if (chrome.webRequest.onResponseStarted) {
+  chrome.webRequest.onResponseStarted.addListener(details => {
+    if (isBackgroundPage(details)) return;
+    const ipReady = typeof AegisIP !== "undefined" ? AegisIP.ready : Promise.resolve();
+    Promise.all([atlasReady, tabsReady, ipReady]).then(() => handleResponse(details));
+  }, { urls: ["<all_urls>"] });
+}
+
+// "Clear my Aegis One data" removes aegisData: forget the open tabs too, so nothing comes back.
+if (chrome.storage.onChanged) {
+  chrome.storage.onChanged.addListener((changes, area) => {
+    if (area === "local" && changes.aegisData && !changes.aegisData.newValue) { tabSites.clear(); rememberTabs(); }
+  });
+}
+
+// Clean up closed tabs.
+chrome.tabs.onRemoved.addListener(tabId => {
+  tabSites.delete(tabId);
+  mainServer.delete(tabId);
+  rememberTabs();
+});

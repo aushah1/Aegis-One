@@ -1,0 +1,156 @@
+// shared/site-summary.js: what the toolbar popup shows first for the site you're on.
+// Run with: node --test
+const test = require("node:test");
+const assert = require("node:assert");
+globalThis.window = globalThis;
+require("../shared/data.js");
+require("../shared/site-summary.js");
+const { summarize, purposeOf, PURPOSES } = window.AegisSiteSummary;
+
+const NOW = Date.parse("2026-10-24");
+const scored = (s) => Object.assign({}, s, window.AegisData.computeScore(s, NOW));
+const T = {
+  gAds: { domain: "doubleclick.net", company: "Google", category: "Advertising", country: "US" },
+  gAn: { domain: "google-analytics.com", company: "Google", category: "Analytics", country: "US" },
+  fb: { domain: "connect.facebook.net", company: "Facebook", category: "Advertising", country: "US" },
+  amzn: { domain: "amazon-adsystem.com", company: "Amazon.com", category: "Advertising", country: "US" },
+  hotjar: { domain: "hotjar.com", company: "Hotjar", category: "Session recording", country: "MT" },
+  lr: { domain: "rlcdn.com", company: "LiveRamp", category: "Data broker", country: "US" },
+  yandex: { domain: "mc.yandex.ru", company: "Yandex", category: "Session recording", country: "RU" },
+  baidu: { domain: "hm.baidu.com", company: "Baidu", category: "Analytics", country: "CN", listed: true }
+};
+
+const cnn = scored({ domain: "cnn.com", trackers: [T.gAds, T.gAn, T.fb, T.amzn, T.hotjar, T.lr], cookieChoice: "no-reject", policy: { sells: true } });
+
+test("reasons that add points come first, biggest first, and add up to the score", () => {
+  const s = summarize(cnn, { now: NOW });
+  assert.strictEqual(s.domain, "cnn.com");
+  assert.strictEqual(s.grade, cnn.grade);
+  assert.strictEqual(s.reasons.reduce((n, r) => n + r.points, 0), cnn.score);
+  for (let i = 1; i < s.reasons.length; i++) assert.ok(s.reasons[i - 1].points >= s.reasons[i].points);
+  assert.match(s.reasons[0].label, /5 outside companies with trackers here/, "Google's two addresses count once");
+  assert.strictEqual(s.reasons[0].source, "Seen on your visits in the last 7 days");
+  assert.ok(s.reasons.some((r) => r.label === "Policy says it sells personal information" && r.source === "Disclosed in privacy policy"));
+  assert.ok(s.reasons.every((r) => r.points > 0));
+});
+
+test("checks that added nothing are kept as short lines, good news marked good", () => {
+  const s = summarize(cnn, { now: NOW });
+  const flag = s.checks.find((c) => c.label === "No foreign-adversary links");
+  const breach = s.checks.find((c) => c.label === "No breach on record in Have I Been Pwned");
+  assert.strictEqual(flag.tone, "good");
+  assert.strictEqual(breach.tone, "good");
+  const clean = summarize(scored({ domain: "quiet.example", trackers: [], cookieChoice: "none", policy: {} }), { now: NOW });
+  assert.strictEqual(clean.reasons.length, 0);
+  assert.strictEqual(clean.checks.find((c) => c.label === "Privacy policy not checked yet").tone, "info");
+});
+
+test("who saw your visit: companies with their main purpose, flagged first; purposes counted per tracker", () => {
+  const s = summarize(scored({ domain: "tass.com", trackers: [T.gAds, T.yandex, T.fb, T.gAn], cookieChoice: "none", policy: {} }), { now: NOW });
+  assert.strictEqual(s.trackerCount, 4);
+  assert.strictEqual(s.companyCount, 3);
+  assert.deepStrictEqual(s.companies.map((c) => c.name), ["Yandex", "Google", "Facebook"]);
+  assert.strictEqual(s.companies[0].flagged, true);
+  assert.strictEqual(s.companies[0].country, "Russia");
+  assert.strictEqual(s.companies[1].purpose.key, "ads", "Google's main purpose is advertising, not measuring");
+  assert.deepStrictEqual(s.purposes.map((p) => [p.key, p.n]), [["ads", 2], ["measure", 1], ["record", 1]]);
+});
+
+test("alerts: state-run media, then foreign-adversary trackers; one line each", () => {
+  const tass = scored({ domain: "tass.com", owner: { company: "TASS", country: "RU", stateMedia: { classification: "SC" } }, trackers: [T.gAds, T.yandex], cookieChoice: "none", policy: {} });
+  const s = summarize(tass, { now: NOW });
+  assert.deepStrictEqual(s.alerts.map((a) => a.kind), ["state-media", "adversary"]);
+  assert.strictEqual(s.alerts[0].title, "State-run media");
+  assert.match(s.alerts[0].detail, /TASS \(Russia\)/);
+  assert.strictEqual(s.alerts[1].title, "Foreign-adversary tracker");
+  assert.match(s.alerts[1].detail, /Yandex \(Russia\)/);
+});
+
+test("1260H companies say so; a listed-country address only shows when nothing else explains it", () => {
+  const baidu = summarize(scored({ domain: "example.cn", trackers: [T.baidu], cookieChoice: "none", policy: {} }), { now: NOW });
+  assert.match(baidu.alerts[0].detail, /Baidu \(China; Pentagon 1260H list\)/);
+  assert.ok(!baidu.alerts.some((a) => a.kind === "address"), "the tracker already explains the flag");
+  const ir = summarize(scored({ domain: "news.example.ir", trackers: [], cookieChoice: "none", policy: {} }), { now: NOW });
+  assert.deepStrictEqual(ir.alerts.map((a) => a.kind), ["address"]);
+  assert.match(ir.alerts[0].detail, /\.ir \(Iran\)/);
+});
+
+test("a breach reported in the last year is an alert; an old one is only a check", () => {
+  const wired = summarize(scored({ domain: "wired.com", trackers: [], cookieChoice: "declined", policy: {},
+    breach: { name: "Wired", breachDate: "2025-12-01", addedDate: "2026-01-15", pwnCount: 2300000 } }), { now: NOW });
+  assert.deepStrictEqual(wired.alerts.map((a) => a.kind), ["breach"]);
+  assert.match(wired.alerts[0].detail, /Wired \(2025\), 2\.3 million accounts/);
+  const snap = summarize(scored({ domain: "snapchat.com", trackers: [], cookieChoice: "declined", policy: {},
+    breach: { name: "Snapchat", breachDate: "2013-12-31", addedDate: "2014-01-01", pwnCount: 4609615 } }), { now: NOW });
+  assert.strictEqual(snap.alerts.length, 0);
+  assert.ok(snap.checks.some((c) => /Past data breach on record \(Snapchat, 2013\)/.test(c.label) && c.tone === "info"));
+});
+
+test("Aegis's verdict counts the companies and mentions the cookie choice; the headline is its first sentence", () => {
+  const s = summarize(cnn, { now: NOW });
+  assert.strictEqual(s.verdict,
+    "Yikes. 5 outside companies saw your visits here this week. This site's cookie banner had no Reject button, only Accept.");
+  assert.strictEqual(s.headline, "Yikes. 5 outside companies saw your visits here this week.");
+  assert.strictEqual(s.cookieNote, "This site's cookie banner had no Reject button, only Accept.");
+  const calm = summarize(scored({ domain: "docs.example", trackers: [], cookieChoice: "declined", policy: {} }), { now: NOW });
+  assert.strictEqual(calm.verdict, "Looking good. No outside companies showed up here. You declined the extra cookies, nice.");
+  const quiet = summarize(scored({ domain: "plain.example", trackers: [], cookieChoice: "none", policy: {} }), { now: NOW });
+  assert.strictEqual(quiet.cookieNote, "");
+});
+
+test("every tracker category has a purpose, and unknown ones count as unlabelled tracking", () => {
+  for (const cat of ["Advertising", "Analytics", "Session recording", "Data broker", "Social", "Malware", "High-risk", "Obscure ownership", "Tracking"]) {
+    assert.ok(PURPOSES.some((p) => p.key === purposeOf(cat).key), cat);
+  }
+  assert.strictEqual(purposeOf("Measuring your visits").key, "measure", "the dashboard's labels map back too");
+  assert.strictEqual(purposeOf("Something new").key, "other");
+});
+
+// Range, coverage and label (Justin's grade-scale doc, repo owner 2026-10-24): shown next to the score, in words.
+test("checked: Fully checked names what stays unknown; Partly checked names what's missing and how high it could go", () => {
+  const full = summarize(cnn, { now: NOW });
+  assert.strictEqual(full.checked.full, true);
+  assert.strictEqual(full.checked.label, "Fully checked");
+  assert.strictEqual(full.checked.coverage, 100);
+  assert.match(full.checked.note, /Every line of the grade has an answer\. What companies do with data on their own servers is still unknown\./);
+  const part = summarize(scored({ domain: "news.example", trackers: [T.gAds, T.fb, T.amzn], cookieChoice: "accepted", policy: {} }), { now: NOW });
+  assert.strictEqual(part.score, 40);
+  assert.strictEqual(part.checked.full, false);
+  assert.strictEqual(part.checked.label, "Partly checked");
+  assert.strictEqual(part.checked.coverage, 87);
+  assert.deepStrictEqual(part.checked.range, { min: 40, max: 55 });
+  assert.strictEqual(part.checked.note, "The privacy policy isn't read yet, so this could be as high as 55 of 100 (C).");
+  const same = summarize(scored({ domain: "q.example", trackers: [], cookieChoice: "none", policy: { sells: false, source: "https://q.example/privacy" } }), { now: NOW });
+  assert.strictEqual(same.checked.note, "The privacy policy doesn't say whether it shares, so this could be as high as 8 of 100 (still an A).");
+});
+
+// "How this grade was calculated" for judges (Justin's grade-scale doc, section 5): numbered steps with this site's numbers.
+test("steps: the site's own points add up, then the letter, the unknowns and the label", () => {
+  const { steps } = window.AegisSiteSummary;
+  const site = scored({ domain: "news.example", trackers: [T.gAds, T.fb, T.amzn], cookieChoice: "accepted", policy: {} });
+  const s = steps(site);
+  assert.strictEqual(s.length, 5);
+  assert.match(s[0], /news\.example/);
+  assert.match(s[1], /15 \+ 15 \+ 10 = 40/);
+  assert.match(s[2], /40 is a B \(B is 21-40\)/);
+  assert.match(s[3], /privacy policy isn't read yet: up to \+15 more, so the range is 40-55/);
+  assert.match(s[3], /range is 40-55 \(B to C\)/);
+  const one = steps(scored({ domain: "n.example", trackers: [T.gAds, T.fb, T.amzn, { domain: "scorecardresearch.com", company: "Comscore", category: "Analytics", country: "US" }], cookieChoice: "accepted", policy: {} }));
+  assert.match(one[3], /range is 45-60 \(a C either way\)/);
+  assert.match(s[4], /Partly checked: 87% of the grade's 115 possible points have an answer/);
+  const clean = steps(scored({ domain: "q.example", trackers: [], cookieChoice: "declined", policy: { sells: false, shares: false } }));
+  assert.match(clean[1], /Nothing added points, so the score is 0/);
+  assert.match(clean[3], /Nothing is unknown, so the range is just 0/);
+  assert.match(clean[4], /Fully checked: 100%/);
+  const capped = steps(scored({ domain: "c.example", trackers: Array.from({ length: 12 }, (_, i) => ({ ...T.gAds, domain: `ad${i}.example`, company: `Ad Co ${i}` })), cookieChoice: "accepted", policy: { sells: true }, owner: { company: "Y", country: "RU" },
+    breach: { name: "X", breachDate: "2026-06-01", addedDate: "2026-07-01" } }));
+  assert.match(capped[1], /= 115, capped at 100/);
+});
+
+// wired.com on the Mac (2026-10-25): "could be as high as 100 of 100 (still an F)" when the score was already 100.
+test("checked: a site already at the top of the scale says an unknown can't raise it", () => {
+  const { checkedFor } = window.AegisSiteSummary;
+  const c = checkedFor({ domain: "loud.example", grade: "F", score: 100, range: { min: 100, max: 100 }, coverage: 0.87, unknowns: ["the privacy policy isn't read yet"] });
+  assert.strictEqual(c.label, "Partly checked");
+  assert.strictEqual(c.note, "The privacy policy isn't read yet, but the score is already at the top (100 of 100), so that can't raise it.");
+});

@@ -1,0 +1,177 @@
+// Aegis One privacy-policy reader (PLAN R3). Loaded by /background.js after tracking.js and shared/policy.js.
+// content/policy-link.js sends the "Privacy" links it finds on a page you're visiting. For a site Aegis One has
+// recorded, and at most once a week per site, this fetches the site's own policy page (without your cookies),
+// asks Gemma the Knowledge Map questions on this computer, and saves the checked answers into site.policy.
+// The score already reads policy.sells / policy.shares (shared/data.js).
+(function () {
+  const RECHECK_MS = 7 * 86400000;      // read each site's policy at most once a week
+  const MAX_HTML = 2000000;             // ignore pages over ~2 MB
+  const KEEP_PAGE_MS = 86400000;        // a page Gemma couldn't read yet is kept (in memory only) for a day
+  const KEEP_PAGES = 5;
+
+  let MAP = null;
+  const mapReady = fetch(chrome.runtime.getURL("shared/knowledge-map.json")).then((r) => r.json())
+    .then((m) => { MAP = m; }).catch((e) => console.warn("Aegis One: knowledge-map.json didn't load; policy reader off", e));
+
+  const inFlight = new Set();
+  const unread = new Map();             // domain -> { html, url, at }: fetched, but Aegis's AI wasn't ready
+
+  // The address the policy request ended up at must still be the same site, and never this computer or a
+  // home-network address (a site's "Privacy" link can forward the request anywhere).
+  function sameSite(url, domain) {
+    try {
+      const u = new URL(url);
+      if (u.protocol !== "http:" && u.protocol !== "https:") return false;
+      const host = u.hostname.replace(/^www\./, "");
+      if (host === "localhost" || /^[\d.]+$/.test(host) || host.includes(":") || host.startsWith("[")) return false;
+      const root = domain.split(".").slice(-2).join(".");
+      return host === root || host.endsWith("." + root);
+    } catch (e) { return false; }
+  }
+
+  async function fetchPolicy(domain, url) {
+    const kept = unread.get(domain);
+    if (kept && kept.url === url && Date.now() - kept.at < KEEP_PAGE_MS) return kept.html;
+    const page = await fetch(url, { credentials: "omit", cache: "no-store", redirect: "follow" });
+    if (!page.ok) return null;
+    if (page.redirected && !sameSite(page.url, domain)) return null;   // forwarded to another site: not read
+    const type = (page.headers && page.headers.get("content-type")) || "";
+    if (!/html|text\/plain/i.test(type)) return null;     // PDFs and the like are skipped
+    return (await page.text()).slice(0, MAX_HTML);
+  }
+  let ownChain = Promise.resolve();
+
+  // Save through tracking.js's save chain when it's loaded, so writes to aegisData never overlap.
+  function save(domain, policy) {
+    const work = async () => {
+      const res = await chrome.storage.local.get("aegisData");
+      const data = res.aegisData;
+      const site = data && Array.isArray(data.sites) && data.sites.find((s) => s.domain === domain);
+      if (!site) return;
+      site.policy = { ...(site.policy || {}), ...policy };
+      if (site.policy.checkedAt === undefined) delete site.policy.checkedAt;   // first answers only: not read yet
+      await chrome.storage.local.set({ aegisData: data });
+    };
+    if (typeof saveChain !== "undefined") {
+      saveChain = saveChain.then(work).catch((e) => console.warn("Aegis One: could not save policy", e));
+      return saveChain;
+    }
+    ownChain = ownChain.then(work).catch((e) => console.warn("Aegis One: could not save policy", e));
+    return ownChain;
+  }
+
+  // Answers saved before the quote checks (G14, Oct 25: bbc's "We sell premium advertising space" saved as selling
+  // personal information) are checked again whenever Aegis One starts. One that fails becomes unknown, so the grade shows
+  // a range; the policy isn't read again just for this.
+  function recheckSaved() {
+    const work = async () => {
+      const data = (await chrome.storage.local.get("aegisData")).aegisData;
+      if (!data || !Array.isArray(data.sites)) return;
+      let changed = false;
+      for (const site of data.sites) {
+        const p = site && site.policy ? AegisPolicy.recheck(site.policy) : null;
+        if (p && p !== site.policy) { site.policy = p; changed = true; }
+      }
+      if (changed) await chrome.storage.local.set({ aegisData: data });
+    };
+    if (typeof saveChain !== "undefined") { saveChain = saveChain.then(work).catch((e) => console.warn("Aegis One: could not recheck policies", e)); return; }
+    ownChain = ownChain.then(work).catch((e) => console.warn("Aegis One: could not recheck policies", e));
+  }
+  recheckSaved();
+
+  // While Aegis reads a site's policy, the pop-up and dashboard say "Reading the privacy policy" (shared/data.js
+  // readingPolicies). Kept in session storage: { domain: when the read started }.
+  const READING_KEY = "aegisPolicyReading";
+  const reading = {};
+  function showReading(domain, on) {
+    if (on) reading[domain] = Date.now(); else delete reading[domain];
+    if (chrome.storage.session) chrome.storage.session.set({ [READING_KEY]: { ...reading } }).catch(() => {});
+  }
+  // A read that was going when Chrome paused this script isn't going any more.
+  if (chrome.storage.session) chrome.storage.session.remove(READING_KEY).catch(() => {});
+
+  async function findSite(domain) {
+    const res = await chrome.storage.local.get("aegisData");
+    return res.aegisData && Array.isArray(res.aegisData.sites) && res.aegisData.sites.find((s) => s.domain === domain);
+  }
+
+  // Should this site's policy be read? Returns the policy link, or null.
+  async function wanted(domain, links) {
+    await mapReady;
+    if (!MAP || inFlight.has(domain)) return null;
+    const prefs = (await chrome.storage.local.get("aegisSettings")).aegisSettings;
+    if (prefs && prefs.policyReader === false) return null;    // turned off in Settings
+    let site = await findSite(domain);
+    // The links can arrive before tracking.js has saved this visit: wait for that save, then look again.
+    if (!site && typeof saveChain !== "undefined") { await saveChain; site = await findSite(domain); }
+    if (!site) return null;                                    // only sites Aegis One has recorded
+    const p = site.policy || {};
+    if (p.checkedAt && Date.now() - Date.parse(p.checkedAt) < RECHECK_MS) return null;
+    if (inFlight.has(domain)) return null;
+    return AegisPolicy.pickPolicyLink(links, domain);         // same site only
+  }
+
+  async function read(domain, url) {
+    let html = null;
+    showReading(domain, true);              // the time it really started (it may have waited for another site)
+    try {
+      html = await fetchPolicy(domain, url);
+      if (!html) return;
+      // "low": Ask Aegis questions go first; a policy read pauses while Aegis is answering someone.
+      // In-browser AI version: shared/ai.js picks Gemma in the browser (or Ollama); tests load only gemma.js.
+      const AI = typeof AegisAI !== "undefined" ? AegisAI : AegisGemma;
+      // Selling and sharing (the grade's questions) are asked first; their answers are saved right away, without
+      // checkedAt, so the grade updates while the other questions are read and a read cut off halfway is tried again.
+      const onBatch = (soFar) => save(domain, { ...soFar, checkedAt: undefined });
+      const policy = await AegisPolicy.readPolicy({ html, url }, MAP, (q, o) => AI.ask(q, { ...o, priority: "low" }), { onBatch });
+      unread.delete(domain);
+      await save(domain, policy);
+    } catch (e) {
+      // Gemma off, network error, or not a policy page: save nothing, so the next visit tries again.
+      // A page that did arrive is kept in memory for a day, so the retry doesn't fetch it again.
+      if (html) {
+        unread.set(domain, { html, url, at: Date.now() });
+        while (unread.size > KEEP_PAGES) unread.delete(unread.keys().next().value);
+      }
+      console.log(`Aegis One: couldn't read the privacy policy for ${domain}`, e && e.message);   // normal; tried again next visit
+    } finally {
+      inFlight.delete(domain);
+      showReading(domain, false);
+    }
+  }
+
+  // One policy at a time, so Gemma isn't flooded. The site asked for most recently goes next: that's the one
+  // you're looking at.
+  const waiting = [];                   // { domain, url }, newest last
+  let busy = null;
+  function pump() {
+    if (busy) return busy;
+    busy = (async () => {
+      try { while (waiting.length) { const job = waiting.pop(); await read(job.domain, job.url); } }
+      finally { busy = null; }
+    })();
+    return busy;
+  }
+
+  const checking = new Set();           // link messages still being looked at
+  chrome.runtime.onMessage.addListener((msg) => {
+    if (!msg || msg.type !== "aegis-policy-links" || !msg.domain || !Array.isArray(msg.links)) return;
+    const domain = String(msg.domain).replace(/^www\./, "");
+    const links = msg.links.slice(0, 40);
+    const job = wanted(domain, links).then((url) => {
+      if (!url || inFlight.has(domain)) return;
+      inFlight.add(domain);
+      showReading(domain, true);
+      waiting.push({ domain, url });
+      pump();
+    }).catch(() => {}).finally(() => checking.delete(job));
+    checking.add(job);
+  });
+
+  // For tests: resolves when queued policy reads (and their saves) are finished.
+  async function idle() {
+    while (checking.size || busy) { await Promise.all([...checking]); await busy; }
+    await (typeof saveChain !== "undefined" ? saveChain : ownChain);
+  }
+  (typeof self !== "undefined" ? self : window).AegisPolicyReader = { idle };
+})();

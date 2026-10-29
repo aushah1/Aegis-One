@@ -1,0 +1,86 @@
+# Aegis One privacy policy
+
+_Last updated: October 24, 2026_
+
+Aegis One is a free Chrome extension that shows which companies track you on the websites you visit, grades each site's privacy from A to F, and lets Aegis, its on-screen character, decline extra cookies for you. Aegis One comes in two versions that handle data the same way: the main version runs Aegis's AI inside Chrome, and the Ollama version uses the Ollama app on your computer instead. Lines that apply to only one version say so. This policy explains exactly what Aegis One handles, where it goes, and how to delete it. The rules for using Aegis One are in [TERMS.md](TERMS.md).
+
+**The short version:** what Aegis One learns about your browsing stays on your computer. We (the Aegis One team) never receive it, and Aegis One never sells it, shares it, or sends it to an AI company, an advertiser or any server of ours. We have no servers, no accounts, no analytics and no ads.
+
+## What Aegis One records, and why
+
+Aegis One needs to see the websites you visit to do its one job: telling you who tracks you there. On your computer only (in Chrome's extension storage), it keeps:
+
+| What | Why | How long |
+|---|---|---|
+| Names of websites you visit (for example `cnn.com`), never full web addresses | To grade each site and show who followed you across sites | Until 7 days after your last visit to that site. It is deleted automatically when Chrome starts, once a day, and whenever Aegis One saves a visit, so this holds even if you don't browse. |
+| Which tracking companies and outside servers each site contacted, the company that owns the site when it is known, and the country of a server when it is in one of the countries on the U.S. foreign-adversary list. Never the server's IP address. | To list trackers and flag companies or servers in countries on U.S. government lists | Same as the site |
+| How many times you opened each site, and on how many of those visits each tracking company showed up (counts only) | So a company that showed up only once in a while doesn't change the grade | Same as the site |
+| Names, owners and lifetimes of cookies (never their contents) | To show what each site stores in your browser | Same as the site |
+| Your cookie-banner choice on each site (declined, accepted, no Reject button) | To grade how the site asked for consent | Same as the site |
+| Short answers about each site's privacy policy (for example "says it sells data"), the exact sentence that backs each answer, and the address of that policy page (without anything after a `?`) | Part of the grade, and so you can check the quote yourself | Same as the site |
+| Daily totals (numbers only, no site names): how often Aegis appeared, how you answered, how many trackers and risky sites you saw | The "Aegis's impact" and "Safety" views | 90 days |
+| The sites open in your tabs right now, and the sites Aegis has already warned you about since Chrome started | So Aegis doesn't warn you twice and the panel knows which site a tab shows | Until you close Chrome |
+| Your questions to Aegis and Aegis's answers | To show the conversation | Only while the page you asked on is open |
+| Your settings (light/dark, glass color, which pop-ups Aegis may show, Ollama or in-browser AI) | To remember your choices | Until you change them or remove Aegis One |
+| Names of sites where the grade box already appeared today, with the day (never full web addresses) | So the grade box shows once per site a day | 7 days |
+| Names of sites where the unsafe-site warning already appeared today, with the day (never full web addresses; main version) | So the warning shows once per site a day | 7 days |
+| Aegis's AI model, if you download it (main version only: about 2 GB, in Chrome's cache) | So Aegis can answer on your computer | Until you click **Delete download** or remove Aegis One |
+| Public lists of data breaches and data brokers | To flag breached sites and data-broker trackers | Replaced once a day |
+
+Aegis One never reads or stores what you type into websites, passwords, form contents, cookie contents, page contents, or full web addresses of the pages you visit.
+
+## What Aegis One does on websites
+
+- **Aegis on cookie banners.** When a site shows a cookie banner, Aegis offers to click its Reject button (or, if you turn on **Protect me automatically**, clicks it without asking). Aegis One then reads the site's own consent cookie only to answer "are the optional cookies off?", keeps only that yes or no, and never stores the cookie.
+- **"Do not sell or share my personal information."** When a page shows a button with exactly that label, Aegis One clicks it once on that page to opt you out of the site selling or sharing your data, as U.S. state privacy laws allow. This has no off switch yet, because it can only reduce what a site may do with your data.
+- **Alerts.** Aegis warns you about banners with no Reject button and about connections to companies on U.S. government lists.
+- **Unsafe-site warning (main version).** On a site Aegis One grades F that also loads a company on those lists or had a data breach reported in the last year, Aegis names the reasons and offers **Go back** or **Continue anyway**. It never blocks the site. Once per site a day; turn it off in **Settings › Unsafe-site warnings**.
+- **Grade box.** A few seconds after a site opens, a small box in the top right shows its grade (once per site a day), and after you decline or accept cookies it explains what that choice means. Turn it off in **Settings › Show the grade box**.
+- **Clear this site's data.** Only when you tap it twice in Aegis One's pop-up, Chrome removes that one site's own cookies, saved data and cache. Aegis One never removes your history, passwords or downloads.
+
+You can turn each of Aegis's pop-ups, and automatic declining, on or off in **Settings › Aegis on websites**.
+
+## Network requests Aegis One makes
+
+Aegis One downloads whole public files (the same file for everyone) and does all matching on your computer, so these requests never say which sites you visit. Like any download, each request shows the server your computer's IP address, which that service handles under its own privacy policy.
+
+| Request | When | What is sent |
+|---|---|---|
+| `haveibeenpwned.com` (public list of data breaches) | About once a day (when Chrome starts, if the copy is over a day old) | An ordinary request for the whole list. No site names. |
+| `cppa.ca.gov` (California Data Broker Registry) | About once a day (when Chrome starts, if the copy is over a day old) | An ordinary request for the whole list. No site names. |
+| `huggingface.co` (Aegis's AI model, Gemma 4, about 2 GB; main version only) | Only when you click **Download Aegis's brain** | An ordinary file download. No browsing data. |
+| A site's own privacy-policy page | When you visit a site that links to its privacy policy and policy reading is on (**Settings › On this computer**) | A request to that same site for the page its own "Privacy" link points to, sent **without your cookies** so you aren't identified. If the site forwards the request within the same site, Aegis One follows it. If it forwards it to another website, or to an address on your own computer or home network, Aegis One throws the reply away and reads nothing. After a successful read, Aegis One waits a week before reading that site's policy again. If Aegis's AI isn't set up yet, nothing is saved; the page is kept in memory only (never saved) for up to a day, so a later visit tries again without fetching it again. |
+| `localhost:11434` (Ollama, only if you installed it) | When you ask Aegis a question, or a policy is read, and Ollama is the AI in use | Your question (or the policy text) and a summary of your Aegis One data, sent to the Ollama app **on your own computer**. Aegis One uses only models that run on your computer, never Ollama's cloud models. |
+
+Aegis's AI runs on your computer, inside Chrome (or in Ollama on your computer). Your questions and your browsing are never sent to an AI company or any other server.
+
+## Sharing and selling
+
+Aegis One does not sell, rent, share, or transfer your data to anyone, does not use it for advertising, credit decisions, or any purpose other than showing you your own privacy information, and has no servers that receive it. The Aegis One team cannot see your data.
+
+## Limited Use
+
+The use of information received from Chrome APIs by Aegis One adheres to the [Chrome Web Store User Data Policy](https://developer.chrome.com/docs/webstore/program-policies/user-data-faq), including the Limited Use requirements. Specifically, Aegis One uses browsing data only to provide its single purpose, showing you who tracks you and helping you limit it; does not transfer it to third parties; does not use it for advertising; and no human reads it.
+
+## Deleting your data
+
+- **Settings › Clear my Aegis One data** deletes your site history, daily totals and the grade box's and warning's lists of sites right away, and forgets the sites in your open tabs. Your settings stay.
+- **Delete download** on the Ask Aegis card deletes Aegis's 2 GB AI model (main version).
+- Closing Chrome deletes the open-tab and already-warned lists.
+- Removing the extension in `chrome://extensions` deletes all of it.
+
+Because all of this lives only on your computer, these buttons are the whole story: there is no copy anywhere else for us to delete, export or correct.
+
+## Children
+
+Aegis One is a general-audience tool and is not directed at children under 13. It collects no personal information from anyone, and the Aegis One team receives nothing.
+
+## Changes
+
+If Aegis One ever changes what it records or sends, we will update this page and tell you inside the extension before the change takes effect. The date at the top shows the latest version.
+
+## Contact
+
+Questions: open an issue at https://github.com/gormandyp/HackAGator_Privacy_Extension/issues.
+
+Aegis One was built at Gator Hack V (University of Florida, 2026) by Josh Davis, Max Glassman, Matthew Finkelstein, Justin Smilowitz and Preston (gormandyp).
