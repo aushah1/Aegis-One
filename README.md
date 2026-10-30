@@ -1,253 +1,292 @@
+<div align="center">
+
 # Aegis One
 
-**Privacy intelligence and website auditing in one Chrome extension.**
+### Privacy intelligence meets website auditing.
 
-Aegis One combines browser-side privacy monitoring with a website-health audit workspace. Inspect tracking behavior and cookies, review site privacy information, and launch technical audits covering performance, accessibility, SEO, security headers, and TLS from one extension dashboard.
+**One extension. Clearer insight into every website.**
 
-> **Project status:** Hackathon prototype / local-development build. The privacy features run in the browser, while website audits require a separately running local Node.js service. The merged build has not been verified end-to-end on every Chrome/OS combination. Results are informative, not legal, security-certification, or accessibility-compliance guarantees.
+[Features](#features) · [Getting Started](#getting-started) · [Architecture](#architecture) · [Configuration](#configuration) · [Development](#development) · [Credits](#credits-and-licensing)
+
+</div>
+
+---
+
+## Overview
+
+**Aegis One** is a Chrome extension that brings together website privacy insights and technical website auditing in one dashboard. It helps people understand the trackers and cookies they encounter, explore privacy-policy information, and examine how a website performs across key technical checks.
+
+For developers and site owners, Aegis One provides a convenient starting point for investigating performance, SEO, accessibility, and security configuration. For everyday users, it makes privacy signals easier to discover and interpret.
 
 ## Features
 
-### Privacy workspace 
+###  Privacy intelligence
 
-- Site-level tracking and cookie intelligence, with privacy grades and a browser dashboard.
-- Cookie-consent assistance and privacy-policy reading tools.
-- A local Gemma-powered privacy assistant through LiteRT-LM/WebGPU; see the original model setup documentation under `docs/`.
-- Browser-side privacy data processing in the original extension components.
+- **Tracker visibility:** Inspect detected third-party tracking activity and the companies associated with it.
+- **Site privacy grades:** Review site-level exposure scores and the factors behind them.
+- **Cookie insights:** Understand tracking cookies and use supported cookie-consent assistance.
+- **Privacy dashboard:** Explore browsing-related privacy signals, trends, and per-site findings.
+- **Ask Aegis:** Ask questions about privacy-policy content using an on-device Gemma model, where supported.
 
-### Website audit 
+###  Website auditing
 
-- A **Website audit** tab inside the extension dashboard, and a popup shortcut to reach it.
-- URL-based checks for performance, accessibility, SEO, security headers, and TLS, subject to service configuration and external availability.
-- Optional AI-written audit explanations using the configured backend provider.
-- Audit history/results managed by a Node API and background worker.
+- **Performance:** Review metrics obtained through Google PageSpeed Insights.
+- **SEO:** Inspect common on-page SEO signals and issues.
+- **Accessibility:** Review available accessibility audit findings.
+- **Security headers:** Inspect HTTP response-header configuration.
+- **TLS/SSL:** Examine certificate and connection-related signals.
+- **AI-assisted summaries:** Turn audit findings into readable explanations and suggested next steps when an AI provider is configured and available.
 
-**Not a standalone offline auditor:** Starting the audit requires MongoDB, Redis, the Node API, and the worker. Privacy assistant and audit AI are separate paths.
+The website audit runs through a separate Node.js service; the Chrome extension provides the integrated interface.
+
+## Tech Stack
+
+| Layer | Technologies |
+| --- | --- |
+| Chrome extension | JavaScript, HTML, CSS, Chrome Manifest V3 and Chrome APIs |
+| Local AI | Gemma 4, LiteRT-LM, WebGPU |
+| Backend API | Node.js, Express.js |
+| Audit processing | Redis, BullMQ, Node.js worker |
+| Data storage | MongoDB, Mongoose |
+| Hosted AI (optional) | Gemini API; Groq fallback |
+| Website checks | Google PageSpeed Insights, SEO, HTTP headers, TLS/SSL |
+| Development | Git, GitHub, Node.js test runner |
 
 ## Architecture
 
 ```text
-Chrome extension (Manifest V3)
-  ├─ Popup + dashboard
-  ├─ Background service worker + content scripts
-  ├─ Privacy monitor / policy reader / local Gemma
-  └─ Website audit tab ── HTTP ──> localhost:4000/api/audits
-                                          │
-                                   Express API
-                                          │
-                                 MongoDB + Redis
-                                          │
-                                      Audit worker
-                                          │
-                           Website checks / optional AI APIs
+                    ┌───────────────────────────┐
+                    │   Aegis One Extension     │
+                    │   Popup + Dashboard       │
+                    └─────────────┬─────────────┘
+                                  │
+                ┌─────────────────┴─────────────────┐
+                │                                   │
+      ┌─────────▼─────────┐              ┌──────────▼─────────┐
+      │ Privacy Workspace │              │ Website Audit UI   │
+      │ Trackers, cookies,│              │ Submit URL, view   │
+      │ grades, policies  │              │ results            │
+      └─────────┬─────────┘              └──────────┬─────────┘
+                │                                   │ HTTP
+      ┌─────────▼─────────┐              ┌──────────▼─────────┐
+      │ Local Gemma Model │              │ Express API        │
+      │ LiteRT-LM/WebGPU  │              └──────────┬─────────┘
+      └───────────────────┘                         │
+                                         ┌──────────▼─────────┐
+                                         │ Redis + BullMQ     │
+                                         │ Audit job queue    │
+                                         └──────────┬─────────┘
+                                                    │
+                                         ┌──────────▼─────────┐
+                                         │ Audit Worker       │
+                                         │ PSI / SEO / TLS /  │
+                                         │ Security headers   │
+                                         └──────────┬─────────┘
+                                                    │
+                                     ┌──────────────┴──────────────┐
+                                     │                             │
+                               ┌─────▼─────┐                ┌──────▼──────┐
+                               │ MongoDB   │                │ Gemini/Groq │
+                               │ Results   │                │ (optional) │
+                               └───────────┘                └─────────────┘
 ```
 
-## Requirements
+## Getting Started
 
-- **Google Chrome** with support for Manifest V3 extensions.
-- **Node.js 20.6+** and npm for the website audit service.
-- **Docker Desktop / Docker Engine with Compose**, or independently configured MongoDB and Redis instances.
-- Internet access for external website checks and optional API providers.
-- For the original in-browser Gemma assistant: compatible WebGPU hardware and the separately downloaded model; see [`docs/IN-BROWSER-AI.md`](docs/IN-BROWSER-AI.md).
+### Prerequisites
 
-## Quick start
+- Google Chrome with Manifest V3 support
+- Node.js **20.6+** and npm
+- MongoDB and Redis running locally, or Docker with Compose
+- Internet access for website checks and optional AI APIs
+- A compatible browser/GPU setup if using local Gemma inference
 
-### 1. Load the extension
+### 1. Clone the repository
 
-1. Clone or download this repository and extract it.
-2. Open `chrome://extensions` in Chrome.
-3. Turn on **Developer mode**.
-4. Choose **Load unpacked** and select the **repository root** (the folder containing `manifest.json`).
-5. Pin **Aegis One** and open its dashboard.
+```bash
+git clone <YOUR-REPOSITORY-URL>
+cd <YOUR-REPOSITORY-DIRECTORY>
+```
 
-You can inspect privacy-related UI before starting the audit service. Local Gemma features require model setup and initialization documented in `docs/`.
+Replace the placeholders with the URL and directory name of your published repository.
 
-### 2. Configure the audit backend
+### 2. Install the Chrome extension
 
-Open a terminal at the repository root:
+1. Open `chrome://extensions`.
+2. Enable **Developer mode**.
+3. Click **Load unpacked**.
+4. Select the project root containing `manifest.json`.
+5. Pin **Aegis One** to your Chrome toolbar and open the dashboard.
+
+Privacy monitoring runs in the extension. To enable the local Gemma assistant, follow [the in-browser AI setup guide](docs/IN-BROWSER-AI.md) and initialize the model in the extension.
+
+### 3. Configure the audit service
+
+From the repository root:
 
 ```bash
 cd audit-service
 npm install
 ```
 
-Create a configuration file from the supplied template:
+Create your environment file:
 
-```bash
-# macOS / Linux / Git Bash
-cp .env.example .env
-```
-
-Windows PowerShell:
+**Windows PowerShell**
 
 ```powershell
 Copy-Item .env.example .env
 ```
 
-Edit `audit-service/.env`. The relevant fields are:
+**macOS / Linux / Git Bash**
+
+```bash
+cp .env.example .env
+```
+
+Then edit `audit-service/.env`:
 
 ```dotenv
 PORT=4000
 CLIENT_ORIGIN=http://localhost:5173
-MONGO_URL=mongodb://localhost:27017/audit
-REDIS_URL=redis://localhost:6379
 
-# Optional: Google PageSpeed Insights API key
+MONGO_URL=mongodb://127.0.0.1:27017/audit
+REDIS_URL=redis://127.0.0.1:6379
+
+# Optional PageSpeed Insights configuration
 PSI_API_KEY=
 
-# Optional: AI-generated audit explanations
+# AI summaries (optional)
+AI_PROVIDERS=gemini
 GEMINI_API_KEY=
 GEMINI_MODEL=gemma-4-26b-a4b-it
-AI_PROVIDERS=gemini
 
-# Optional alternate AI provider
+# Optional fallback provider
 GROQ_API_KEY=
 GROQ_MODEL=llama-3.1-8b-instant
+
+# Optional AI timeout settings, if supported by your worker version
+AI_REQUEST_TIMEOUT_MS=60000
+AI_TOTAL_TIMEOUT_MS=190000
 ```
 
-**Important:** The model identifier is a configurable default, not a guarantee that your Gemini account has access to it. Verify the model's availability before relying on AI summaries. Without an AI key, supported non-AI checks may still work.
+The `CLIENT_ORIGIN` value supports the original local web-client configuration; the Chrome extension uses its own origin. You do **not** need to host a separate frontend to use the integrated dashboard.
 
-Never commit `.env` or put API secrets in extension HTML, JavaScript, or `manifest.json`: extension source code is inspectable by users.
+**Keep API keys on the backend.** Never commit `.env`, include secrets in the extension, or expose keys in screenshots.
 
-### 3. Start MongoDB and Redis
+### 4. Start MongoDB and Redis
 
-From `audit-service/`:
+If you use Docker Compose:
 
 ```bash
 docker compose up -d
 docker compose ps
 ```
 
-### 4. Start the API and worker
+If MongoDB and Redis are already running on your machine, keep using them and ensure the connection URLs in `.env` match your local ports.
 
-Open **two terminals**, both in `audit-service/`:
+### 5. Start the API and worker
 
-Terminal 1:
+In two separate terminals, from the `audit-service` directory:
 
-```bash
-npm run dev -w server
-```
-
-Terminal 2:
+**Terminal 1 — API**
 
 ```bash
-npm run dev -w worker
+node --env-file=.env server/src/index.js
 ```
 
-You **do not** need to run the audit tool's separate `client` workspace; its interface is integrated into the Chrome extension.
+**Terminal 2 — Audit worker**
 
-### 5. Run a sample audit
+```bash
+node --env-file=.env worker/src/index.js
+```
 
-1. Open the Aegis One extension dashboard.
+Both services must use the same MongoDB and Redis instances. The worker consumes audit jobs using BullMQ.
+
+### 6. Run your first audit
+
+1. Open the Aegis One dashboard.
 2. Select **Website audit**.
-3. Enter `https://example.com` and start the audit.
-4. Review the results. If a report is missing, check the server and worker terminals for errors.
+3. Enter `https://example.com`.
+4. Start the audit and inspect its progress and results.
 
-The extension is currently configured to call **`http://localhost:4000/api/audits`**. If you change the server port or deploy it remotely, adjust `dashboard/audit.js`, extension host permissions and the backend's allowed origins accordingly.
+By default, the audit UI targets `http://localhost:4000/api/audits`. To use a deployed API, update the URL in `dashboard/audit.js` and adjust extension host permissions and backend CORS settings accordingly.
 
-## Repository layout
+## Project Structure
 
 ```text
 AegisOne/
-├── manifest.json              # Chrome extension metadata and permissions
-├── background.js              # Extension service-worker entry point
-├── background/                # Tracking, privacy events, policy logic
-├── content/                   # Scripts injected into visited websites
-├── popup/                     # Toolbar popup
-├── dashboard/                 # Extension dashboard, including audit.js
-├── shared/                    # Shared data, AI and feature utilities
-├── offscreen/                 # Local model inference integration
-├── vendor/                    # Bundled third-party runtime components
-├── icons/                     # Extension artwork: logo.svg and logo.png only
+├── manifest.json                # Chrome extension manifest
+├── background.js                # Background service-worker entry
+├── background/                  # Tracker and privacy logic
+├── content/                     # Website content scripts
+├── popup/                       # Toolbar popup
+├── dashboard/                   # Dashboard and website audit interface
+├── shared/                      # Shared privacy and AI utilities
+├── offscreen/                   # Local model inference integration
+├── vendor/                      # Bundled dependencies
+├── icons/                       # Extension assets
 ├── audit-service/
-│   ├── server/                # API
-│   ├── worker/                # Asynchronous audit execution
-│   ├── client/                # Original audit frontend (not required)
-│   ├── .env.example           # Configuration template
-│   └── docker-compose.yml     # MongoDB and Redis
-├── tests/                     # Original extension tests
-├── docs/                      # Architecture and original AI setup guides
-├── SETUP.md                   # Concise install instructions
-├── LICENSE                    # Original Aegis One MIT notice
-├── THIRD_PARTY_LICENSES.md    # Additional third-party terms
-└── AUDIT_SOURCE_LICENSE_NOTICE.md
+│   ├── server/                  # Express API
+│   ├── worker/                  # BullMQ worker and audit checks
+│   ├── shared/                  # Shared audit data models
+│   ├── .env.example             # Environment configuration template
+│   └── docker-compose.yml       # Local Redis and MongoDB
+├── docs/                        # Additional documentation
+├── tests/                       # Extension tests
+├── LICENSE
+└── README.md
 ```
 
-## Configuration and secrets
+## Development
 
-| Variable | Needed for | Required? |
-|---|---|---|
-| `PORT` | Audit API port | Yes; default `4000` |
-| `MONGO_URL` | Audit database | Yes for audit service |
-| `REDIS_URL` | Audit job queue | Yes for audit service |
-| `CLIENT_ORIGIN` | Original audit client's CORS origin | Has a default; extension origins are separately allowed |
-| `PSI_API_KEY` | PageSpeed API access / quotas | Optional; some checks may be limited |
-| `GEMINI_API_KEY` | AI audit summaries through Gemini | Optional |
-| `GEMINI_MODEL` | Gemini model selection | Configure based on account availability |
-| `AI_PROVIDERS` | Preferred AI provider order | Optional configuration |
-| `GROQ_API_KEY` | Alternate AI summaries through Groq | Optional |
-| `GROQ_MODEL` | Groq model selection | Optional |
-
-The **local Chrome Gemma privacy assistant** does **not** use `GEMINI_API_KEY` by default. It has its own model download and setup requirements.
-
-## Testing and verification
-
-From the **repository root**:
+Run the extension's test suite from the repository root:
 
 ```bash
 node --test
 ```
 
-This runs the repository's existing Node tests. A passing suite does not prove the audit backend, browser permissions, external APIs, or downloaded model work end-to-end. Test all of those manually before a demo or release.
+After changing extension code, reload Aegis One from `chrome://extensions` and refresh any affected tabs. Restart the backend processes after modifying server or worker code unless you are running them in watch mode.
 
-Suggested manual smoke test:
+### Common issues
 
-1. Verify the extension loads without a Manifest error.
-2. Visit a test website and inspect privacy insights.
-3. Open the Website audit tab.
-4. Confirm the API and worker are running and an example audit completes.
-5. Try the audit without an AI key and verify graceful fallback.
-6. Inspect Chrome extension errors and backend logs.
+| Issue | Suggested check |
+| --- | --- |
+| Extension does not load | Select the directory containing `manifest.json` and review Chrome's error details. |
+| Audit cannot connect | Ensure the API is listening on port `4000` and inspect `dashboard/audit.js`. |
+| Audits stay queued | Check Redis connectivity and confirm the BullMQ worker is running. |
+| MongoDB connection fails | Check `MONGO_URL` and whether MongoDB is running. |
+| AI summary fails | Verify model access, API key, worker logs, output formatting, and timeouts. Technical audit results can still be available. |
+| Local model does not start | Check WebGPU support, available memory, and `docs/IN-BROWSER-AI.md`. |
 
-## Troubleshooting
+## Privacy and Security
 
-| Symptom | What to check |
-|---|---|
-| Chrome rejects the extension | Select the folder containing `manifest.json`; inspect `chrome://extensions` errors |
-| Website audit says connection failed | API running on port 4000; `dashboard/audit.js` address; firewall/CORS settings |
-| Mongo connection refused | `docker compose ps`, `MONGO_URL`, port 27017 |
-| Redis connection refused | `docker compose ps`, `REDIS_URL`, port 6379 |
-| Audit remains queued | Worker running; Redis connected; worker logs |
-| AI summary missing | Key, configured model, provider quota and worker output |
-| Local Gemma cannot initialize | Chrome/WebGPU support, model download, memory limits; see `docs/IN-BROWSER-AI.md` |
+Aegis One includes browser-level monitoring features, so it requests permissions to inspect relevant web activity. Review `manifest.json` before installation.
 
-## Security and privacy considerations
-
-- The extension requests broad browser permissions to inspect site activity. Review `manifest.json` before installing.
-- The original privacy assistant uses local inference. **Website audit requests are not exclusively local**: the backend contacts target sites and may use configured third-party providers.
-- Never audit systems without authorization. Respect provider terms, target-server load, and applicable rules.
-- Do not submit private credentials, tokens, or unredacted customer data as audit input.
-- This development configuration uses localhost services. Production distribution requires separate deployment, origin restrictions, secure transport, secrets management, and abuse prevention.
-
-## Origins, attribution, and licensing
-
-Aegis One combines **existing open-source code and user-supplied audit source**. It should be represented as a derivative integration, not as a wholly original project.
-
-- **Aegis One**: original privacy-extension foundation, by the original Aegis One contributors; source: [gormandyp/Aegis One](https://github.com/gormandyp/Aegis One). Preserve the original MIT copyright and license notice in [`LICENSE`](LICENSE).
-- **Website audit tool**: integrated from the supplied `audit-tool.zip`. **No license grant was included with that archive.** Confirm ownership or obtain redistribution permission before publishing its source or distributing the combined extension. See [`AUDIT_SOURCE_LICENSE_NOTICE.md`](AUDIT_SOURCE_LICENSE_NOTICE.md).
-- **Third-party assets and datasets**: review [`THIRD_PARTY_LICENSES.md`](THIRD_PARTY_LICENSES.md) before commercial use or redistribution; some data may have non-commercial restrictions.
-
-For hackathon submissions, explicitly describe the **new integration, redesign, and any original features** you built, and comply with event rules on pre-existing code.
+- The privacy assistant can perform local inference when its model is installed and supported.
+- Website audits require a running backend and contact the target website and configured third-party services.
+- Audit results are informational; they do not constitute security certification, legal findings, or proof of accessibility compliance.
+- Only audit websites you own or are authorized to test.
+- A public deployment should add authentication, usage limits, restricted origins, secure secret storage, and protection against unsafe URL requests.
 
 ## Roadmap
 
-- [ ] End-to-end audit integration tests
-- [ ] Configurable remote audit API with production authentication
-- [ ] Better audit progress and error recovery
-- [ ] Per-site privacy and website-health report in one view
-- [ ] Exportable combined privacy/audit report
-- [ ] Verify all third-party redistribution and commercial-use rights
+- [ ] Combined per-site privacy and website-health reports
+- [ ] Exportable and shareable audit reports
+- [ ] Scheduled audits and change detection
+- [ ] Improved AI-summary reliability and validation
+- [ ] Multi-site monitoring for developers and teams
+- [ ] Production-ready authentication and service deployment
+
+## Credits and Licensing
+
+Aegis One integrates and extends existing software. The privacy-extension foundation is based on [PrivaC by gormandyp and contributors](https://github.com/gormandyp/PrivaC). The current project adds its own branding, unified interface, and website-audit integration.
+
+The website-audit component has a separate provenance and licensing status; consult [`AUDIT_SOURCE_LICENSE_NOTICE.md`](AUDIT_SOURCE_LICENSE_NOTICE.md) where included. Redistribution of any component requires the applicable rights or permissions. Preserve the upstream copyright and license notices in [`LICENSE`](LICENSE), and review [`THIRD_PARTY_LICENSES.md`](THIRD_PARTY_LICENSES.md) for additional asset and dataset restrictions.
 
 ---
 
-**Aegis One:** understand how a website handles your privacy, and inspect how well it is built, from one workspace.
+<div align="center">
+
+**Aegis One** — *One extension. Complete website intelligence.*
+
+</div>
